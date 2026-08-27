@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -57,7 +58,15 @@ void CommitUnmount(SegmentPool& pool, const Segment& segment,
 
 }  // namespace
 
-class SegmentTest : public ::testing::Test {};
+class SegmentTest : public ::testing::Test {
+   protected:
+    // Friend access to the NoF pool mutex: lets a test reproduce the
+    // foreground Allocate() critical section (shared pool lock held
+    // across the allocator call) without hooking the allocator.
+    static std::shared_mutex& AccessPoolMutex(NoFSegmentManager& manager) {
+        return manager.pool_mutex_;
+    }
+};
 
 TEST_F(SegmentTest, MemoryDriverLifecycleAndPrepareRollback) {
     MemoryRegionDriver driver(BufferAllocatorType::OFFSET);
@@ -589,4 +598,117 @@ TEST_F(SegmentTest, QueryAndClientIndexesFollowLifecycle) {
     CommitUnmount(pool, b, client);
 }
 
+namespace {
+
+NoFSegment MakeNoFSegment(size_t index, std::string name,
+                           std::string host = {}) {
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = std::move(name);
+    segment.base = 0x100000000ULL + index * 0x2000000ULL;
+    segment.size = kRegionSize;
+    segment.te_endpoint = segment.name + "-nof-endpoint";
+    segment.host_id = std::move(host);
+    return segment;
+}
+
+}  // namespace
+
+// PT snapshot collection (RFC 0005 §7.3): reports carry identity and
+// space accounting for every mounted segment.
+TEST_F(SegmentTest, NoFSpaceReportsTrackMountedSegments) {
+    NoFSegmentManager manager(BufferAllocatorType::OFFSET);
+    const UUID client = generate_uuid();
+    auto a = MakeNoFSegment(0, "nof-a", "host-a");
+    auto b = MakeNoFSegment(1, "nof-b", "host-b");
+    {
+        auto access = manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.MountSegment(a, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
+    }
+
+    std::vector<NoFSegmentManager::SegmentSpaceReport> reports;
+    manager.GetSegmentSpaceReports(reports);
+    ASSERT_EQ(reports.size(), 2U);
+    for (const auto& report : reports) {
+        EXPECT_FALSE(report.unknown_capacity);
+        EXPECT_EQ(report.capacity, kRegionSize);
+        if (report.segment_id == a.id) {
+            EXPECT_EQ(report.name, a.name);
+            EXPECT_EQ(report.host_id, "host-a");
+        } else {
+            EXPECT_EQ(report.segment_id, b.id);
+            EXPECT_EQ(report.name, b.name);
+            EXPECT_EQ(report.host_id, "host-b");
+        }
+    }
+}
+
+// The P0 fix: space reports take the pool shared lock, so a report scan
+// must complete while a foreground allocation is in flight holding the
+// same shared lock. Allocate() takes ScopedPlacementAccess (shared)
+// across the allocator call; replicate that critical section directly
+// and verify a concurrent scan overlaps instead of serializing behind
+// an exclusive acquisition.
+TEST_F(SegmentTest, NoFSpaceReportsRunConcurrentlyWithSharedLockHolders) {
+    NoFSegmentManager manager(BufferAllocatorType::OFFSET);
+    const UUID client = generate_uuid();
+    auto segment = MakeNoFSegment(0, "nof-blocking", "host-a");
+    {
+        auto access = manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    }
+
+    std::atomic<bool> report_done{false};
+    std::shared_lock<std::shared_mutex> held(AccessPoolMutex(manager));
+    auto report = std::async(std::launch::async, [&] {
+        std::vector<NoFSegmentManager::SegmentSpaceReport> reports;
+        manager.GetSegmentSpaceReports(reports);
+        report_done.store(true);
+        return reports.size();
+    });
+
+    // Foreground Put critical section: shared pool lock held while the
+    // allocator runs (mimics ScopedPlacementAccess in Allocate()).
+    const auto status = report.wait_for(std::chrono::seconds(2));
+    held.unlock();
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(report_done.load());
+    EXPECT_EQ(report.get(), 1U);
+}
+
+// Mount/unmount keep the exclusive lock: a report scan waits for the mount
+// critical section and observes the complete post-mount segment set.
+TEST_F(SegmentTest, NoFSpaceReportScanDoesNotObserveHalfMount) {
+    NoFSegmentManager manager(BufferAllocatorType::OFFSET);
+    const UUID client = generate_uuid();
+    auto a = MakeNoFSegment(0, "nof-a", "host-a");
+    {
+        auto access = manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.MountSegment(a, client), ErrorCode::OK);
+    }
+
+    auto b = MakeNoFSegment(1, "nof-b", "host-b");
+    std::future<std::vector<NoFSegmentManager::SegmentSpaceReport>> report;
+    std::promise<void> report_started;
+    auto report_started_future = report_started.get_future();
+    {
+        auto access = manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
+        report = std::async(std::launch::async, [&] {
+            report_started.set_value();
+            std::vector<NoFSegmentManager::SegmentSpaceReport> reports;
+            manager.GetSegmentSpaceReports(reports);
+            return reports;
+        });
+        report_started_future.wait();
+        EXPECT_EQ(report.wait_for(std::chrono::milliseconds(100)),
+                  std::future_status::timeout);
+    }
+
+    ASSERT_EQ(report.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    const auto reports = report.get();
+    EXPECT_EQ(reports.size(), 2U);
+}
 }  // namespace mooncake

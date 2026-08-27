@@ -33,6 +33,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "nof_segment_manager.h"
+#include "placement/pt_rebuild_scheduler.h"
 #include "segment/pool.h"
 #include "segment/pool_access.h"
 #include "local_ssd/manager.h"
@@ -1982,6 +1983,18 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
     void NofHeartbeatThreadFunc();
+
+    // Translates MasterServiceConfig into the builder-facing PT config
+    // (RFC 0005). Used only by the USE_NOF initialization path.
+    static PtBuildConfig BuildPtBuildConfig(const MasterServiceConfig& config);
+
+    // Validates ReplicateConfig.nof_replica_num under the PT lane (RFC 0005
+    // §7.1): 0 = no NoF, 1 = single-replica mode, R_config = multi-replica
+    // mode; any other value is INVALID_PARAMS and must not be silently
+    // rewritten. The caller invokes this only for the enabled PT lane.
+    tl::expected<size_t, ErrorCode> ValidateNofReplicaCount(
+        size_t requested_nof_replica_num) const;
+
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
         const std::string& error_reason);
@@ -2631,6 +2644,11 @@ class MasterService {
     SegmentPool segment_pool_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
+    // NoF PT placement (RFC 0005). The scheduler exists only while the
+    // foreground PT lane is enabled; disabled mode stays entirely legacy.
+    const bool enable_nof_pt_allocation_;
+    const uint32_t nof_pt_replica_num_;
+    std::unique_ptr<PtRebuildScheduler> pt_rebuild_scheduler_;
     BufferAllocatorType memory_allocator_type_;
     const PlacementPolicyType memory_policy_type_;
     const PlacementPolicyType nof_policy_type_;

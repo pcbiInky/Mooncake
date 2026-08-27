@@ -4,12 +4,29 @@
 #include <numeric>
 
 #include "master_metric_manager.h"
+#include "placement/nof_pt_replica_allocator.h"
 
 namespace mooncake {
+
+NoFSegmentManager::NoFSegmentManager(
+    BufferAllocatorType memory_allocator)
+    : memory_allocator_(memory_allocator) {}
+
+NoFSegmentManager::~NoFSegmentManager() = default;
+
+void NoFSegmentManager::SetPtEnabled(bool enabled) {
+    if (enabled && !pt_allocator_) {
+        pt_allocator_ = std::make_unique<NofPtReplicaAllocator>(pt_view_manager_);
+    }
+    pt_enabled_.store(enabled, std::memory_order_release);
+}
 
 tl::expected<std::vector<Replica>, ErrorCode> NoFSegmentManager::Allocate(
     PlacementPolicyType policy_type, const SegmentAllocationRequest& request) {
     ScopedPlacementAccess placement(placement_index_, pool_mutex_);
+    if (pt_enabled_.load(std::memory_order_acquire)) {
+        return pt_allocator_->Allocate(placement, request);
+    }
     const ReplicaAllocationRequest resolved{
         .size = request.size,
         .replica_count = request.replica_count,
@@ -56,7 +73,8 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
     auto target = std::make_unique<AllocationTarget>(
-        allocator.get(), AllocationTargetKind::STANDARD);
+        allocator.get(), AllocationTargetKind::STANDARD, std::string(),
+        segment.id);
     nof_segment_manager_->placement_index_.AddTarget(segment.name,
                                                      target.get());
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -163,6 +181,53 @@ ErrorCode ScopedNoFSegmentAccess::GetMountedSegments(
             {id, mounted.client_id, mounted.segment, mounted.status});
     }
     return ErrorCode::OK;
+}
+
+void NoFSegmentManager::GetSegmentSpaceReports(
+    std::vector<SegmentSpaceReport>& reports) const {
+    std::shared_lock lock(pool_mutex_);
+    reports.clear();
+    reports.reserve(mounted_segments_.size());
+    for (const auto& [id, mounted] : mounted_segments_) {
+        SegmentSpaceReport report;
+        report.segment_id = id;
+        report.name = mounted.segment.name;
+        report.host_id = mounted.segment.host_id;
+        if (mounted.buf_allocator) {
+            const size_t capacity = mounted.buf_allocator->capacity();
+            if (capacity == kAllocatorUnknownFreeSpace) {
+                report.unknown_capacity = true;
+            } else {
+                report.capacity = capacity;
+                // Prefer the bin-precise total free space from the offset
+                // allocator over capacity - Used(): cur_size_ counts
+                // requested bytes only and misses bin fragmentation.
+                if (const auto* offset_allocator =
+                        dynamic_cast<const OffsetBufferAllocator*>(
+                            mounted.buf_allocator.get())) {
+                    const auto storage =
+                        offset_allocator->getOffsetAllocator()
+                            ->storageReport();
+                    report.used =
+                        capacity > storage.totalFreeSpace
+                            ? capacity - storage.totalFreeSpace
+                            : 0;
+                    report.largest_free = storage.largestFreeRegion;
+                } else {
+                    const size_t used = mounted.buf_allocator->size();
+                    report.used = used < capacity ? used : capacity;
+                    report.largest_free =
+                        mounted.buf_allocator->getLargestFreeRegion();
+                    if (report.largest_free == kAllocatorUnknownFreeSpace) {
+                        report.unknown_capacity = true;
+                    }
+                }
+            }
+        } else {
+            report.unknown_capacity = true;
+        }
+        reports.push_back(std::move(report));
+    }
 }
 
 ErrorCode ScopedNoFSegmentAccess::GetAllSegments(

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <random>
+#include <vector>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -77,6 +78,14 @@ TEST(RandomTest, RejectsInvalidBounds) {
     std::mt19937_64 engine(42);
     EXPECT_THROW(randomIndex(0, engine), std::invalid_argument);
     EXPECT_THROW(randomUniform(2, 1, engine), std::invalid_argument);
+}
+
+TEST(RandomTest, ShufflePreservesElements) {
+    std::vector<int> values{1, 2, 3, 4, 5};
+    std::mt19937_64 engine(42);
+    randomShuffle(values.begin(), values.end(), engine);
+    std::sort(values.begin(), values.end());
+    EXPECT_EQ(values, (std::vector<int>{1, 2, 3, 4, 5}));
 }
 
 TEST(UtilsTest, ByteSizeToString) {

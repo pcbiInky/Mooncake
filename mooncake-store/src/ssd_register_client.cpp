@@ -3,6 +3,8 @@
 #include <cctype>
 #include <cstdlib>
 
+#include "utils.h"
+
 namespace mooncake {
 
 NoFRegisterClient::NoFRegisterClient()
@@ -47,6 +49,19 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
     segment.id = generate_uuid();
     segment.name = te_endpoint;
     segment.te_endpoint = te_endpoint;
+    // The NoF serving address is a deployment-level node identity in the
+    // first version. Reuse the existing normalizer so callers do not need a
+    // new host_id parameter and all namespaces on one traddr share a domain.
+    segment.host_id = ResolveMooncakeHostId(traddr);
+    if (segment.host_id.empty()) {
+        LOG(WARNING)
+            << "NoF traddr cannot be resolved to a host_id; segment will "
+               "mount for legacy allocation but remain TOPOLOGY_INCOMPLETE "
+               "and be excluded from PT views";
+    } else {
+        LOG(INFO) << "Segment host_id resolved as '" << segment.host_id
+                  << "' (PT failure domain)";
+    }
     auto mount_result = master_client_.MountNoFSegment(segment);
     if (!mount_result) {
         LOG(ERROR) << "mount_segment_to_master_failed ";

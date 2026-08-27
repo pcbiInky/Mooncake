@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
+#include <atomic>
 #include <memory>
 #include <ostream>
 #include <shared_mutex>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "placement/replica_allocator.h"
+#include "placement/pt_view.h"
 #include "rpc_types.h"
 #include "segment/pool_types.h"
 
@@ -47,6 +49,7 @@ inline std::ostream& operator<<(
     return os;
 }
 
+class NofPtReplicaAllocator;
 class NoFSegmentManager;
 
 class ScopedNoFSegmentAccess final {
@@ -66,6 +69,7 @@ class ScopedNoFSegmentAccess final {
                                 std::vector<NoFSegment>& segments) const;
     ErrorCode GetMountedSegments(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
@@ -77,9 +81,26 @@ class ScopedNoFSegmentAccess final {
 
 class NoFSegmentManager final {
    public:
+    // NoF PT placement (RFC 0005 §7.3): live per-segment space report.
+    // used is physical (capacity - totalFreeSpace), including bin
+    // fragmentation; unknown_capacity marks allocators without precise
+    // reports (Cachelib) which the PT builder excludes.
+    struct SegmentSpaceReport {
+        UUID segment_id;
+        std::string name;
+        std::string host_id;
+        uint64_t capacity{0};
+        uint64_t used{0};
+        uint64_t largest_free{0};
+        bool unknown_capacity{false};
+    };
+
     explicit NoFSegmentManager(
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
-        : memory_allocator_(memory_allocator) {}
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+
+    // Out-of-line: destroying the NofPtReplicaAllocator unique_ptr member
+    // requires its complete type, which only the .cpp includes.
+    ~NoFSegmentManager();
 
     ScopedNoFSegmentAccess getNoFSegmentAccess() {
         return ScopedNoFSegmentAccess(this, pool_mutex_);
@@ -87,6 +108,22 @@ class NoFSegmentManager final {
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         PlacementPolicyType policy_type,
         const SegmentAllocationRequest& request);
+
+    // Read-only PT snapshot collection. Uses the pool shared lock so it can
+    // run concurrently with foreground allocations; mount/unmount still use
+    // ScopedNoFSegmentAccess and take the exclusive lock.
+    void GetSegmentSpaceReports(std::vector<SegmentSpaceReport>& reports) const;
+
+    // NoF PT placement (RFC 0005). When pt_enabled is true, Allocate()
+    // routes to the PT lane using views published into this manager. Must
+    // be called once from the owning thread before serving traffic (the
+    // MasterService constructor); the PT allocator is created here so the
+    // Allocate() fast path stays lock-free and race-free.
+    // Defined in the .cpp: constructing NofPtReplicaAllocator requires its
+    // complete type, which is only included there.
+    void SetPtEnabled(bool enabled);
+    PtViewManager& GetPtViewManager() { return pt_view_manager_; }
+
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
@@ -114,6 +151,11 @@ class NoFSegmentManager final {
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;
     ClientByRegionName client_by_name_;
+
+    // NoF PT placement (RFC 0005).
+    std::atomic<bool> pt_enabled_{false};
+    PtViewManager pt_view_manager_;
+    std::unique_ptr<NofPtReplicaAllocator> pt_allocator_;
 
     friend class ScopedNoFSegmentAccess;
     friend class SegmentTest;

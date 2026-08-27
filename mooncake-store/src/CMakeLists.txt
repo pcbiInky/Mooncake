@@ -23,6 +23,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_view.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    placement/pt_view_builder.cpp
+    placement/nof_pt_replica_allocator.cpp
     nof_segment_manager.cpp
     segment/region_driver.cpp
     segment/region_initial_state.cpp

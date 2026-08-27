@@ -1,4 +1,5 @@
 #include "placement/replica_allocator.h"
+#include "placement/nof_pt_replica_allocator.h"
 
 #include <gtest/gtest.h>
 
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "local_ssd/manager.h"
+#include "random.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {
@@ -23,7 +25,7 @@ class PlacementState {
         std::string logical_name, std::string endpoint,
         size_t capacity = kCapacity, size_t used = 0,
         AllocationTargetKind kind = AllocationTargetKind::STANDARD,
-        std::string cxl_binding = {}) {
+        std::string cxl_binding = {}, UUID region_id = UUID{0, 0}) {
         auto allocator = std::make_shared<TestBufferAllocator>(
             logical_name, std::move(endpoint), capacity,
             kind == AllocationTargetKind::CXL ? DEFAULT_CXL_BASE + cxl_offset_
@@ -35,7 +37,7 @@ class PlacementState {
         }
         allocator->SetUsed(used);
         auto target = std::make_unique<AllocationTarget>(
-            allocator.get(), kind, std::move(cxl_binding));
+            allocator.get(), kind, std::move(cxl_binding), region_id);
         EXPECT_TRUE(index.AddTarget(logical_name, target.get()));
         auto* result = allocator.get();
         allocators.push_back(std::move(allocator));
@@ -70,6 +72,8 @@ ReplicaAllocationRequest Request(size_t replicas = 1) {
     request.replica_count = replicas;
     return request;
 }
+
+UUID RegionId(uint64_t value) { return UUID{value, 1}; }
 
 std::set<std::string> Endpoints(const std::vector<Replica>& replicas) {
     std::set<std::string> result;
@@ -126,6 +130,98 @@ TEST(ReplicaAllocatorTest, RejectsEmptyAndInvalidRequests) {
         allocator.Allocate(populated, PlacementPolicyType::RANDOM, invalid)
             .error(),
         ErrorCode::INVALID_PARAMS);
+}
+
+TEST(NofPtReplicaAllocatorTest, RetriesADistinctRowAfterAllocationFailure) {
+    PlacementState state;
+    auto* bad1 = state.Add("bad1", "bad1", kCapacity, 0,
+                           AllocationTargetKind::STANDARD, {}, RegionId(1));
+    auto* bad2 = state.Add("bad2", "bad2", kCapacity, 0,
+                           AllocationTargetKind::STANDARD, {}, RegionId(2));
+    state.Add("good1", "good1", kCapacity, 0,
+              AllocationTargetKind::STANDARD, {}, RegionId(3));
+    state.Add("good2", "good2", kCapacity, 0,
+              AllocationTargetKind::STANDARD, {}, RegionId(4));
+    bad1->SetAlwaysFail();
+    bad2->SetAlwaysFail();
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    PtPolicyView policy;
+    policy.min_aligned_request_size_exclusive = 0;
+    policy.max_aligned_request_size_inclusive = 8192;
+    policy.entries.resize(2);
+
+    // Put the bad row at the deterministic first draw. The retry must select
+    // the only remaining row and return its allocation.
+    RandomEngine probe(42);
+    const size_t first_row =
+        randomUniform<size_t>(0, policy.entries.size() - 1, probe);
+    const size_t good_row = 1 - first_row;
+    policy.entries[first_row].pt_id = static_cast<uint32_t>(first_row);
+    policy.entries[first_row].replicas = {
+        PtTarget{RegionId(1), "bad1", "host-a", "host-a"},
+        PtTarget{RegionId(2), "bad2", "host-b", "host-b"},
+    };
+    policy.entries[good_row].pt_id = static_cast<uint32_t>(good_row);
+    policy.entries[good_row].replicas = {
+        PtTarget{RegionId(3), "good1", "host-c", "host-c"},
+        PtTarget{RegionId(4), "good2", "host-d", "host-d"},
+    };
+    view->policies.push_back(std::move(policy));
+    view_manager.Publish(std::move(view));
+
+    threadLocalRandomEngine().seed(42);
+    NofPtReplicaAllocator allocator(view_manager);
+    SegmentAllocationRequest request;
+    request.size = 4096;
+    request.replica_count = 1;
+    request.replica_type = ReplicaType::NOF_SSD;
+    auto access = state.Access();
+    auto result = allocator.Allocate(access, request);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+    EXPECT_TRUE(ReplicaEndpoint(result->front()) == "good1" ||
+                ReplicaEndpoint(result->front()) == "good2");
+    EXPECT_EQ(bad1->allocation_calls() + bad2->allocation_calls(), 1U);
+}
+
+TEST(NofPtReplicaAllocatorTest, RollsBackPartialMultiReplicaRow) {
+    PlacementState state;
+    auto* first = state.Add("first", "first", kCapacity, 0,
+                            AllocationTargetKind::STANDARD, {}, RegionId(1));
+    auto* failed = state.Add("failed", "failed", kCapacity, 0,
+                             AllocationTargetKind::STANDARD, {}, RegionId(2));
+    failed->SetAlwaysFail();
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    PtPolicyView policy;
+    policy.min_aligned_request_size_exclusive = 0;
+    policy.max_aligned_request_size_inclusive = 8192;
+    PtEntry entry;
+    entry.pt_id = 0;
+    entry.replicas = {
+        PtTarget{RegionId(1), "first", "host-a", "host-a"},
+        PtTarget{RegionId(2), "failed", "host-b", "host-b"},
+    };
+    policy.entries.push_back(std::move(entry));
+    view->policies.push_back(std::move(policy));
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    SegmentAllocationRequest request;
+    request.size = 4096;
+    request.replica_count = 2;
+    request.replica_type = ReplicaType::NOF_SSD;
+    auto access = state.Access();
+    auto result = allocator.Allocate(access, request);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(first->allocation_calls(), 1U);
+    EXPECT_EQ(first->size(), 0U);
 }
 
 TEST(ReplicaAllocatorTest, SingleGroupFastPathIsBestEffort) {
