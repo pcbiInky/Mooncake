@@ -9,6 +9,7 @@
 #include <memory>   // For std::unique_ptr
 #include <string>
 #include <thread>  // For std::thread
+#include <vector>
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
@@ -513,6 +514,18 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("nof_heartbeat_failures_threshold",
                              &master_config.nof_heartbeat_failures_threshold,
                              FLAGS_nof_heartbeat_failures_threshold);
+
+    // NoF PT placement (RFC 0005)
+    default_config.GetBool("enable_nof_pt_allocation",
+                           &master_config.enable_nof_pt_allocation, false);
+    default_config.GetUInt32("nof_pt_count", &master_config.nof_pt_count, 128);
+    default_config.GetUInt32("nof_pt_replica_num",
+                             &master_config.nof_pt_replica_num, 2);
+    default_config.GetDouble("nof_pt_host_increment_skew_k",
+                             &master_config.nof_pt_host_increment_skew_k, 1.5);
+    default_config.GetDurationMs("nof_pt_rebuild_interval_ms",
+                                 &master_config.nof_pt_rebuild_interval_ms,
+                                 60000);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);

@@ -140,6 +140,7 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(pt_view_balance_test pt_view_balance_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)

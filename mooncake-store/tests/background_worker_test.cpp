@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <stdexcept>
 
 #include <gtest/gtest.h>
 
@@ -63,6 +64,57 @@ TEST(BackgroundWorkerTest, ScheduleIsIgnoredWhileStopped) {
 
     std::lock_guard<std::mutex> lock(mutex);
     EXPECT_EQ(callback_count, 0);
+}
+
+TEST(BackgroundWorkerTest, PeriodicModeRunsWithoutSchedule) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t callback_count = 0;
+    BackgroundWorker worker(
+        [&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++callback_count;
+            cv.notify_all();
+        },
+        std::chrono::milliseconds(10));
+
+    worker.Start();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return callback_count > 0; }));
+    }
+    worker.Stop();
+    EXPECT_GT(callback_count, 0U);
+}
+
+TEST(BackgroundWorkerTest, SchedulePreemptsPeriodicWait) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t callback_count = 0;
+    BackgroundWorker worker(
+        [&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++callback_count;
+            cv.notify_all();
+        },
+        std::chrono::hours(1));
+
+    worker.Start();
+    worker.Schedule();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return callback_count == 1; }));
+    }
+    worker.Stop();
+    EXPECT_EQ(callback_count, 1U);
+}
+
+TEST(BackgroundWorkerTest, RejectsNonPositivePeriodicInterval) {
+    EXPECT_THROW(
+        BackgroundWorker([] {}, std::chrono::milliseconds(0)),
+        std::invalid_argument);
 }
 
 }  // namespace mooncake::test

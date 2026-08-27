@@ -20,6 +20,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment.cpp
+    placement/pt_view_builder.cpp
+    placement/nof_pt_replica_allocator.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp

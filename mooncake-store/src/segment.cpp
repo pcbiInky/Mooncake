@@ -2,6 +2,7 @@
 
 #include "ha/snapshot/local_ssd_codec.h"
 #include "master_metric_manager.h"
+#include "placement/nof_pt_replica_allocator.h"
 #include "utils/zstd_util.h"
 
 #include <functional>
@@ -1168,6 +1169,81 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
 
     mounted_segment.status = status;
     return ErrorCode::OK;
+}
+
+NoFSegmentManager::NoFSegmentManager(BufferAllocatorType memory_allocator)
+    : memory_allocator_(memory_allocator) {}
+
+NoFSegmentManager::~NoFSegmentManager() = default;
+
+void NoFSegmentManager::SetPtEnabled(bool enabled) {
+    if (enabled && !pt_allocator_) {
+        pt_allocator_ = std::make_unique<NofPtReplicaAllocator>(pt_view_manager_);
+    }
+    pt_enabled_.store(enabled, std::memory_order_release);
+}
+
+tl::expected<std::vector<Replica>, ErrorCode> NoFSegmentManager::AllocatePt(
+    size_t size, size_t replica_count) {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    if (!pt_enabled_.load(std::memory_order_acquire) || !pt_allocator_) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    return pt_allocator_->Allocate(
+        size, replica_count,
+        [this](const PtTarget& target,
+               size_t allocation_size) -> std::unique_ptr<AllocatedBuffer> {
+            const auto it = mounted_segments_.find(target.region_id);
+            if (it == mounted_segments_.end() ||
+                it->second.status != SegmentStatus::OK ||
+                it->second.segment.name != target.name ||
+                !it->second.buf_allocator) {
+                return nullptr;
+            }
+            return it->second.buf_allocator->allocate(allocation_size);
+        });
+}
+
+void NoFSegmentManager::GetSegmentSpaceReports(
+    std::vector<SegmentSpaceReport>& reports) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    reports.clear();
+    reports.reserve(mounted_segments_.size());
+    for (const auto& [id, mounted] : mounted_segments_) {
+        SegmentSpaceReport report;
+        report.segment_id = id;
+        report.name = mounted.segment.name;
+        report.host_id = mounted.segment.host_id;
+        if (mounted.buf_allocator) {
+            const size_t capacity = mounted.buf_allocator->capacity();
+            if (capacity == kAllocatorUnknownFreeSpace) {
+                report.unknown_capacity = true;
+            } else {
+                report.capacity = capacity;
+                if (const auto* offset_allocator =
+                        dynamic_cast<const OffsetBufferAllocator*>(
+                            mounted.buf_allocator.get())) {
+                    const auto storage =
+                        offset_allocator->getOffsetAllocator()->storageReport();
+                    report.used = capacity > storage.totalFreeSpace
+                                      ? capacity - storage.totalFreeSpace
+                                      : 0;
+                    report.largest_free = storage.largestFreeRegion;
+                } else {
+                    const size_t used = mounted.buf_allocator->size();
+                    report.used = used < capacity ? used : capacity;
+                    report.largest_free =
+                        mounted.buf_allocator->getLargestFreeRegion();
+                    if (report.largest_free == kAllocatorUnknownFreeSpace) {
+                        report.unknown_capacity = true;
+                    }
+                }
+            }
+        } else {
+            report.unknown_capacity = true;
+        }
+        reports.push_back(std::move(report));
+    }
 }
 
 /* ScopedNoFSegmentAccess Implementation */

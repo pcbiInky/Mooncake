@@ -30,6 +30,7 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "environ.h"
+#include "placement/pt_view_builder.h"
 #include "segment.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
@@ -212,7 +213,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
-      nof_segment_manager_(config.memory_allocator),
+      nof_segment_manager_(config.enable_nof_pt_allocation
+                               ? BufferAllocatorType::OFFSET
+                               : config.memory_allocator),
+#ifdef USE_NOF
+      enable_nof_pt_allocation_(config.enable_nof_pt_allocation),
+      nof_pt_replica_num_(config.nof_pt_replica_num),
+#else
+      enable_nof_pt_allocation_(false),
+      nof_pt_replica_num_(2),
+#endif
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -355,6 +365,46 @@ MasterService::MasterService(const MasterServiceConfig& config)
         return SpdkWrapper::GetInstance().ProbeNofSegment(
             te_endpoint, timeout_ms, error_reason);
     };
+
+    if (config.enable_nof_pt_allocation) {
+        if (config.nof_pt_replica_num < 2) {
+            LOG(ERROR) << "nof_pt_replica_num must be >= 2, current "
+                       << config.nof_pt_replica_num;
+            throw std::invalid_argument("Invalid nof_pt_replica_num");
+        }
+        if (config.nof_pt_count == 0 ||
+            (config.nof_pt_count & (config.nof_pt_count - 1)) != 0) {
+            LOG(ERROR) << "nof_pt_count must be a power of two, current "
+                       << config.nof_pt_count;
+            throw std::invalid_argument("Invalid nof_pt_count");
+        }
+        if (!std::isfinite(config.nof_pt_host_increment_skew_k) ||
+            config.nof_pt_host_increment_skew_k < 1.0) {
+            LOG(ERROR) << "nof_pt_host_increment_skew_k must be >= 1.0";
+            throw std::invalid_argument(
+                "Invalid nof_pt_host_increment_skew_k");
+        }
+        if (config.nof_pt_rebuild_interval_ms == 0) {
+            LOG(ERROR) << "nof_pt_rebuild_interval_ms must be positive";
+            throw std::invalid_argument(
+                "Invalid nof_pt_rebuild_interval_ms");
+        }
+        if (config.memory_allocator != BufferAllocatorType::OFFSET) {
+            LOG(WARNING)
+                << "NoF allocator forced to OFFSET for PT capacity reports; "
+                << "memory_allocator only applies to Memory/CXL lanes";
+        }
+        pt_rebuild_scheduler_ = std::make_unique<PtRebuildScheduler>(
+            nof_segment_manager_, BuildPtBuildConfig(config),
+            std::chrono::milliseconds(config.nof_pt_rebuild_interval_ms));
+        nof_segment_manager_.SetPtEnabled(true);
+        pt_rebuild_scheduler_->Start();
+        LOG(INFO) << "NoF PT scheduler started, pt_count="
+                  << config.nof_pt_count
+                  << ", replica_num=" << config.nof_pt_replica_num
+                  << ", rebuild_interval_ms="
+                  << config.nof_pt_rebuild_interval_ms;
+    }
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -651,6 +701,9 @@ MasterService::~MasterService() {
     replica_cleanup_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
+    if (pt_rebuild_scheduler_) {
+        pt_rebuild_scheduler_->Stop();
+    }
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
@@ -954,6 +1007,9 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
         return {};
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
+    }
+    if (pt_rebuild_scheduler_) {
+        pt_rebuild_scheduler_->RequestRebuild();
     }
     return {};
 #endif
@@ -1299,6 +1355,9 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
     ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
+    }
+    if (pt_rebuild_scheduler_) {
+        pt_rebuild_scheduler_->RequestRebuild();
     }
     return {};
 #endif
@@ -2766,6 +2825,9 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
     }
+    if (pt_rebuild_scheduler_) {
+        pt_rebuild_scheduler_->RequestRebuild();
+    }
     return {};
 #endif
 }
@@ -4042,6 +4104,20 @@ auto MasterService::AllocateAndInsertMetadata(
 
     const uint64_t pending_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
+#ifdef USE_NOF
+    if (enable_nof_pt_allocation_) {
+        if (const auto validated =
+                ValidateNofReplicaCount(config.nof_replica_num);
+            !validated) {
+            LOG(WARNING)
+                << "key=" << key
+                << ", action=put_start_invalid_nof_replica_num"
+                << ", requested_nof_replicas=" << config.nof_replica_num
+                << ", configured_nof_pt_replica_num=" << nof_pt_replica_num_;
+            return tl::make_unexpected(validated.error());
+        }
+    }
+#endif
     auto quota_result =
         ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                           pending_quota_charge, &quota_deficit_bytes);
@@ -4123,16 +4199,22 @@ auto MasterService::AllocateAndInsertMetadata(
 #ifdef USE_NOF
     if (config.nof_replica_num > 0 &&
         nof_segment_manager_.getMountedSegmentCount() > 0) {
-        ScopedAllocatorAccess allocator_access =
-            nof_segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
+        auto allocation_result = [&]()
+            -> tl::expected<std::vector<Replica>, ErrorCode> {
+            if (enable_nof_pt_allocation_) {
+                return nof_segment_manager_.AllocatePt(
+                    value_length, config.nof_replica_num);
+            }
 
-        std::vector<std::string> preferred_segments =
-            config.preferred_nof_segments;
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.nof_replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
+            ScopedAllocatorAccess allocator_access =
+                nof_segment_manager_.getAllocatorAccess();
+            const auto& allocator_manager =
+                allocator_access.getAllocatorManager();
+            return allocation_strategy_->Allocate(
+                allocator_manager, value_length, config.nof_replica_num,
+                config.preferred_nof_segments, std::set<std::string>(),
+                ReplicaType::NOF_SSD);
+        }();
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate nof replicas for key=" << key
@@ -11230,6 +11312,9 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
+    if (pt_rebuild_scheduler_) {
+        pt_rebuild_scheduler_->RequestRebuild();
+    }
     LOG(INFO) << "segment_id=" << snapshot.segment_id
               << ", client_id=" << snapshot.client_id
               << ", segment_name=" << snapshot.segment.name
@@ -11237,6 +11322,25 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
               << ", action=unmount_nof_segment_by_heartbeat"
               << ", last_error_reason=" << error_reason;
     return true;
+}
+
+PtBuildConfig MasterService::BuildPtBuildConfig(
+    const MasterServiceConfig& config) {
+    PtBuildConfig pt_config;
+    pt_config.pt_count = config.nof_pt_count;
+    pt_config.replica_num = config.nof_pt_replica_num;
+    pt_config.host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+    return pt_config;
+}
+
+tl::expected<size_t, ErrorCode> MasterService::ValidateNofReplicaCount(
+    size_t requested_nof_replica_num) const {
+    if (requested_nof_replica_num == 0 ||
+        requested_nof_replica_num == 1 ||
+        requested_nof_replica_num == nof_pt_replica_num_) {
+        return requested_nof_replica_num;
+    }
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
 
 void MasterService::NofHeartbeatThreadFunc() {

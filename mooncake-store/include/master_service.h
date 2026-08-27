@@ -33,6 +33,7 @@
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "placement/pt_rebuild_scheduler.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
@@ -2016,6 +2017,11 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
     void NofHeartbeatThreadFunc();
+
+    static PtBuildConfig BuildPtBuildConfig(const MasterServiceConfig& config);
+    tl::expected<size_t, ErrorCode> ValidateNofReplicaCount(
+        size_t requested_nof_replica_num) const;
+
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
         const std::string& error_reason);
@@ -2681,6 +2687,9 @@ class MasterService {
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
+    const bool enable_nof_pt_allocation_;
+    const uint32_t nof_pt_replica_num_;
+    std::unique_ptr<PtRebuildScheduler> pt_rebuild_scheduler_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

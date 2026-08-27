@@ -1,4 +1,5 @@
 #include "allocation_strategy.h"
+#include "placement/nof_pt_replica_allocator.h"
 
 #include <gtest/gtest.h>
 
@@ -961,6 +962,104 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         << "Overhead ratio:      " << std::setprecision(2) << overhead_ratio
         << "x  (" << std::setprecision(1) << (overhead_ratio - 1.0) * 100.0
         << "% slower)\n\n";
+}
+
+namespace {
+
+UUID PtRegionId(uint64_t value) { return UUID{value, 1}; }
+
+using PtAllocatorMap = std::unordered_map<
+    UUID, std::shared_ptr<BufferAllocatorBase>, boost::hash<UUID>>;
+
+NofPtReplicaAllocator::AllocateTargetFn MakePtResolver(
+    const PtAllocatorMap& allocators) {
+    return [&allocators](const PtTarget& target, size_t size) {
+        const auto it = allocators.find(target.region_id);
+        if (it == allocators.end() ||
+            it->second->getSegmentName() != target.name) {
+            return std::unique_ptr<AllocatedBuffer>{};
+        }
+        return it->second->allocate(size);
+    };
+}
+
+}  // namespace
+
+TEST(NofPtReplicaAllocatorTest, RetriesADistinctRowAfterAllocationFailure) {
+    PtAllocatorMap allocators;
+    allocators.emplace(
+        PtRegionId(3),
+        std::make_shared<OffsetBufferAllocator>(
+            "good1", 0x100000000ULL, 16 * MiB, "good1",
+            ReplicaType::NOF_SSD));
+    allocators.emplace(
+        PtRegionId(4),
+        std::make_shared<OffsetBufferAllocator>(
+            "good2", 0x110000000ULL, 16 * MiB, "good2",
+            ReplicaType::NOF_SSD));
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    PtPolicyView policy;
+    policy.min_aligned_request_size_exclusive = 0;
+    policy.max_aligned_request_size_inclusive = 8192;
+    policy.entries.resize(2);
+
+    RandomEngine probe(42);
+    const size_t first_row =
+        randomUniform<size_t>(0, policy.entries.size() - 1, probe);
+    const size_t good_row = 1 - first_row;
+    policy.entries[first_row].replicas = {
+        PtTarget{PtRegionId(1), "bad1", "host-a", "host-a"},
+        PtTarget{PtRegionId(2), "bad2", "host-b", "host-b"},
+    };
+    policy.entries[good_row].replicas = {
+        PtTarget{PtRegionId(3), "good1", "host-c", "host-c"},
+        PtTarget{PtRegionId(4), "good2", "host-d", "host-d"},
+    };
+    view->policies.push_back(std::move(policy));
+    view_manager.Publish(std::move(view));
+
+    threadLocalRandomEngine().seed(42);
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(4096, 1, MakePtResolver(allocators));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+    const auto& descriptor =
+        result->front().get_descriptor().get_nof_descriptor();
+    EXPECT_TRUE(descriptor.buffer_descriptor.transport_endpoint_ == "good1" ||
+                descriptor.buffer_descriptor.transport_endpoint_ == "good2");
+}
+
+TEST(NofPtReplicaAllocatorTest, RollsBackPartialMultiReplicaRow) {
+    PtAllocatorMap allocators;
+    auto first = std::make_shared<OffsetBufferAllocator>(
+        "first", 0x120000000ULL, 16 * MiB, "first",
+        ReplicaType::NOF_SSD);
+    allocators.emplace(PtRegionId(1), first);
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    PtPolicyView policy;
+    policy.min_aligned_request_size_exclusive = 0;
+    policy.max_aligned_request_size_inclusive = 8192;
+    policy.entries.push_back(PtEntry{
+        0,
+        {
+            PtTarget{PtRegionId(1), "first", "host-a", "host-a"},
+            PtTarget{PtRegionId(2), "failed", "host-b", "host-b"},
+        },
+    });
+    view->policies.push_back(std::move(policy));
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(4096, 2, MakePtResolver(allocators));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(first->size(), 0U);
 }
 
 }  // namespace mooncake

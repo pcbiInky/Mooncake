@@ -1,8 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -10,14 +13,26 @@ namespace mooncake {
 
 // Runs a callback on a dedicated thread when scheduled. Multiple Schedule()
 // calls made before the worker consumes the pending request are coalesced into
-// one callback invocation. Start() and Stop() must be called serially by the
-// owner; Schedule() may be called concurrently from other threads.
+// one callback invocation. An optional periodic callback mode is available to
+// callers that also need a fixed-interval safety-net run. Start() and Stop()
+// must be called serially by the owner; Schedule() may be called concurrently
+// from other threads.
 class BackgroundWorker {
    public:
     using Callback = std::function<void()>;
 
     explicit BackgroundWorker(Callback callback)
         : callback_(std::move(callback)) {}
+
+    BackgroundWorker(Callback callback,
+                     std::chrono::milliseconds periodic_interval)
+        : callback_(std::move(callback)),
+          periodic_interval_(periodic_interval) {
+        if (periodic_interval.count() <= 0) {
+            throw std::invalid_argument(
+                "BackgroundWorker periodic interval must be positive");
+        }
+    }
 
     ~BackgroundWorker() { Stop(); }
 
@@ -31,7 +46,11 @@ class BackgroundWorker {
         }
         running_ = true;
         requested_ = false;
-        thread_ = std::thread(&BackgroundWorker::ThreadFunc, this);
+        if (periodic_interval_) {
+            thread_ = std::thread(&BackgroundWorker::PeriodicThreadFunc, this);
+        } else {
+            thread_ = std::thread(&BackgroundWorker::ThreadFunc, this);
+        }
     }
 
     void Stop() {
@@ -75,7 +94,24 @@ class BackgroundWorker {
         }
     }
 
+    void PeriodicThreadFunc() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_for(lock, *periodic_interval_, [this] {
+                    return !running_ || requested_;
+                });
+                if (!running_) {
+                    return;
+                }
+                requested_ = false;
+            }
+            callback_();
+        }
+    }
+
     Callback callback_;
+    const std::optional<std::chrono::milliseconds> periodic_interval_;
     std::mutex mutex_;
     std::condition_variable cv_;
     std::thread thread_;

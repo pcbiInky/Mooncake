@@ -464,9 +464,13 @@ struct NoFSegment {
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
+    // Stable physical host identity for PT failure-domain placement
+    // (RFC 0005). Must be provided by the registering side; segments
+    // without it are excluded from PT builds as TOPOLOGY_INCOMPLETE.
+    std::string host_id{};
     NoFSegment() = default;
 };
-YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint, host_id);
 
 /**
  * @brief Client status from the master's perspective
