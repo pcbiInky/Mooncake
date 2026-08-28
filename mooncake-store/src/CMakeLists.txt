@@ -203,7 +203,7 @@ endif()
 
 if(USE_NOF)
   add_subdirectory(spdk)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES ${SPDK_WRAPPER_SOURCES})
 
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
@@ -459,6 +459,9 @@ if(STORE_USE_REDIS)
 endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
+endif()
+if(USE_NOF)
+  target_link_libraries(mooncake_store_master PRIVATE ${SPDK_STATIC_LIBS})
 endif()
 
 # Complete public Store library.
