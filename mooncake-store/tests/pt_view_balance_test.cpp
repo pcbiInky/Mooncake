@@ -12,6 +12,8 @@
 //  6. Invalid direct builder configuration is rejected.
 //  7. Rack-aware placement, missing-Rack Host fallback, and multi-NIC Hosts.
 //  8. Rack topology and size-class combinations with no feasible PT view.
+//  9. Fixed-seed reproducibility and input-order independence.
+// 10. Straw2 row-pair diversity and bounded scale-out remapping.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -81,6 +83,61 @@ PlacementStats TallyPolicy(const PtPolicyView& policy, uint64_t rng_seed,
         const PtTarget& target =
             entry.replicas[rng() % entry.replicas.size()];
         ++stats.picks[target.name];
+    }
+    return stats;
+}
+
+std::vector<std::string> RowDomains(const PtEntry& entry) {
+    std::vector<std::string> domains;
+    domains.reserve(entry.replicas.size());
+    for (const auto& target : entry.replicas) {
+        domains.push_back(target.failure_domain_id);
+    }
+    std::sort(domains.begin(), domains.end());
+    return domains;
+}
+
+std::vector<std::string> RowTargets(const PtEntry& entry) {
+    std::vector<std::string> targets;
+    targets.reserve(entry.replicas.size());
+    for (const auto& target : entry.replicas) {
+        targets.push_back(target.failure_domain_id + "/" + target.host_id +
+                          "/" + target.name);
+    }
+    std::sort(targets.begin(), targets.end());
+    return targets;
+}
+
+bool SamePolicyLayout(const PtPolicyView& lhs, const PtPolicyView& rhs) {
+    if (lhs.entries.size() != rhs.entries.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.entries.size(); ++i) {
+        if (RowTargets(lhs.entries[i]) != RowTargets(rhs.entries[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct PairDiversityStats {
+    size_t unique_pairs{0};
+    size_t max_pair_rows{0};
+};
+
+PairDiversityStats MeasurePairDiversity(const PtPolicyView& policy) {
+    std::map<std::pair<std::string, std::string>, size_t> pair_rows;
+    for (const auto& entry : policy.entries) {
+        const auto domains = RowDomains(entry);
+        if (domains.size() == 2) {
+            ++pair_rows[{domains[0], domains[1]}];
+        }
+    }
+    PairDiversityStats stats;
+    stats.unique_pairs = pair_rows.size();
+    for (const auto& [pair, rows] : pair_rows) {
+        (void)pair;
+        stats.max_pair_rows = std::max(stats.max_pair_rows, rows);
     }
     return stats;
 }
@@ -473,6 +530,101 @@ int main() {
         Check(!PtViewBuilder::Build(rack_without_contiguous_space, config)
                    .has_value(),
               "scenario10: Rack below smallest size class rejected");
+    }
+
+    // ---- Scenario 11: the default seed is stable, and collection order
+    // does not affect the published placement table.
+    {
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("a0", "hostA", 16, 0, "rackA"),
+            MakeSegment("a1", "hostA", 16, 0, "rackA"),
+            MakeSegment("b0", "hostB", 16, 0, "rackB"),
+            MakeSegment("b1", "hostB", 16, 0, "rackB"),
+            MakeSegment("c0", "hostC", 16, 0, "rackC"),
+            MakeSegment("c1", "hostC", 16, 0, "rackC"),
+            MakeSegment("d0", "hostD", 16, 0, "rackD"),
+            MakeSegment("d1", "hostD", 16, 0, "rackD"),
+        };
+        PtBuildConfig default_seed = config;
+        default_seed.seed = 0;
+        auto first = PtViewBuilder::Build(segments, default_seed);
+        auto second = PtViewBuilder::Build(segments, default_seed);
+        std::reverse(segments.begin(), segments.end());
+        auto reversed = PtViewBuilder::Build(segments, default_seed);
+        Check(first.has_value() && second.has_value() && reversed.has_value(),
+              "scenario11: all deterministic builds succeed");
+        if (first && second && reversed) {
+            Check(first->seed != 0 && first->seed == second->seed &&
+                      first->seed == reversed->seed,
+                  "scenario11: default PT seed is stable");
+            const PtPolicyView* first_policy = first->FindPolicy(2 * kMiB);
+            const PtPolicyView* second_policy = second->FindPolicy(2 * kMiB);
+            const PtPolicyView* reversed_policy =
+                reversed->FindPolicy(2 * kMiB);
+            Check(first_policy && second_policy && reversed_policy,
+                  "scenario11: deterministic policies exist");
+            if (first_policy && second_policy && reversed_policy) {
+                Check(SamePolicyLayout(*first_policy, *second_policy),
+                      "scenario11: repeated build preserves every PT row");
+                Check(SamePolicyLayout(*first_policy, *reversed_policy),
+                      "scenario11: input order preserves every PT row");
+            }
+        }
+    }
+
+    // ---- Scenario 12: fixed-seed straw2 scheduling spreads Rack pairs and
+    // limits unrelated old-Rack changes during scale-out.
+    {
+        std::vector<PtSegmentSnapshot> four_racks;
+        for (size_t i = 0; i < 4; ++i) {
+            const std::string suffix(1, static_cast<char>('A' + i));
+            four_racks.push_back(MakeSegment(
+                "segment" + suffix, "host" + suffix, 16, 0,
+                "rack" + suffix));
+        }
+        auto four_view = PtViewBuilder::Build(four_racks, config);
+        Check(four_view.has_value(), "scenario12: four-Rack view builds");
+        if (!four_view) return failures ? 1 : 0;
+        const PtPolicyView* four_policy = four_view->FindPolicy(2 * kMiB);
+        Check(four_policy != nullptr,
+              "scenario12: four-Rack policy exists");
+        if (four_policy) {
+            const auto diversity = MeasurePairDiversity(*four_policy);
+            Check(diversity.unique_pairs == 6,
+                  "scenario12: all four-Rack pairs are represented");
+            Check(diversity.max_pair_rows <= 32,
+                  "scenario12: no Rack pair dominates more than 25% rows");
+
+            std::vector<PtSegmentSnapshot> five_racks = four_racks;
+            five_racks.push_back(
+                MakeSegment("segmentE", "hostE", 16, 0, "rackE"));
+            auto five_view = PtViewBuilder::Build(five_racks, config);
+            Check(five_view.has_value(),
+                  "scenario12: scale-out view builds");
+            if (five_view) {
+                const PtPolicyView* five_policy =
+                    five_view->FindPolicy(2 * kMiB);
+                Check(five_policy != nullptr,
+                      "scenario12: scale-out policy exists");
+                if (five_policy) {
+                    size_t changed_rows = 0;
+                    size_t new_rack_rows = 0;
+                    for (size_t i = 0; i < four_policy->entries.size(); ++i) {
+                        const auto before =
+                            RowDomains(four_policy->entries[i]);
+                        const auto after = RowDomains(five_policy->entries[i]);
+                        changed_rows += before != after;
+                        new_rack_rows += std::find(
+                                             after.begin(), after.end(),
+                                             "rack:rackE") != after.end();
+                    }
+                    Check(new_rack_rows >= 50 && new_rack_rows <= 52,
+                          "scenario12: new Rack receives its exact share");
+                    Check(changed_rows <= new_rack_rows + 16,
+                          "scenario12: scale-out avoids broad old-Rack churn");
+                }
+            }
+        }
     }
 
     if (failures == 0) {

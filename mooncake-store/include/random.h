@@ -52,18 +52,6 @@ inline size_t randomIndex(size_t upper_bound) {
     return randomIndex(upper_bound, threadLocalRandomEngine());
 }
 
-template <std::random_access_iterator Iterator,
-          std::uniform_random_bit_generator Generator>
-void randomShuffle(Iterator first, Iterator last, Generator& generator) {
-    std::shuffle(first, last, generator);
-}
-
-// Randomly permutes [first, last) with the shared thread-local engine.
-template <std::random_access_iterator Iterator>
-void randomShuffle(Iterator first, Iterator last) {
-    randomShuffle(first, last, threadLocalRandomEngine());
-}
-
 template <std::integral Integer, std::uniform_random_bit_generator Generator>
 Integer randomUniform(Integer lower_bound, Integer upper_bound,
                       Generator& generator) {

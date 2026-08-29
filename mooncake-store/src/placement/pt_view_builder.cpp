@@ -1,8 +1,11 @@
 #include "placement/pt_view_builder.h"
 
+#include <cstdint>
+#include <string_view>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
@@ -15,6 +18,7 @@ namespace {
 
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kDefaultPtSeed = 0x4D4F4F4E43414B45ULL;
 
 uint64_t FreeBytes(const PtSegmentSnapshot& segment) {
     return segment.capacity > segment.used ? segment.capacity - segment.used
@@ -41,6 +45,56 @@ struct SlotPlan {
     std::vector<uint64_t> host_slots;
     std::vector<uint64_t> domain_slots;
 };
+
+// ---------------------------------------------------------------------
+// CRUSH-style deterministic weighted sampling (straw2 / Efraimidis-
+// Spirakis). Stable seed and candidate keys make a complete rebuild
+// reproducible for the same topology and quotas. Row construction still
+// consumes remaining quotas sequentially, so an arbitrary row cannot be
+// recomputed independently without its preceding quota state.
+//
+// NOTE: this is a *probabilistic* pick. It is only used where the
+// caller does not need to guarantee an exact quota on every individual
+// draw (see PickRowGroups for the one place that still does).
+// ---------------------------------------------------------------------
+
+// Deterministic pseudo-random helpers for stable placement decisions. Unlike
+// threadLocalRandomEngine(), these functions are pure: identical seed/key
+// inputs always produce identical results across rebuilds.
+inline uint64_t deterministicRandomMix(uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+inline uint64_t deterministicRandomHash(uint64_t seed, uint64_t key) {
+    return deterministicRandomMix(seed ^ deterministicRandomMix(key));
+}
+
+inline uint64_t deterministicRandomHashString(uint64_t seed,
+                                              std::string_view key) {
+    uint64_t hash = deterministicRandomMix(seed);
+    for (const unsigned char byte : key) {
+        hash = deterministicRandomMix(hash ^ byte);
+    }
+    return hash;
+}
+
+// Efraimidis-Spirakis / straw2-style score. Pick the candidate with the
+// greatest score. A non-positive weight is never selected.
+inline double deterministicWeightedScore(uint64_t seed, uint64_t stream,
+                                         uint64_t key, double weight) {
+    if (!(weight > 0.0) || !std::isfinite(weight)) {
+        return -std::numeric_limits<double>::infinity();
+    }
+    const uint64_t hash = deterministicRandomHash(
+        deterministicRandomHash(seed, stream), key);
+    constexpr double kTwoTo53 = 9007199254740992.0;
+    const double uniform =
+        static_cast<double>((hash >> 11) + 1) / kTwoTo53;
+    return std::log(uniform) / weight;
+}
 
 std::optional<std::vector<double>> DistributeWithCaps(
     const std::vector<double>& weights, const std::vector<double>& caps,
@@ -170,12 +224,30 @@ std::optional<ClassTopology> BuildClassTopology(
         }
     }
 
+    // Canonicalize the class input before assigning vector indices. This
+    // keeps quota rounding and score tie-breaking independent of the order in
+    // which SegmentSpaceReports happened to be collected.
+    std::vector<const PtSegmentSnapshot*> class_segments;
+    class_segments.reserve(eligible.size());
+    for (const auto* segment : eligible) {
+        if (segment->largest_free >= max_inclusive) {
+            class_segments.push_back(segment);
+        }
+    }
+    std::sort(class_segments.begin(), class_segments.end(),
+              [](const auto* lhs, const auto* rhs) {
+                  if (lhs->host_id != rhs->host_id) {
+                      return lhs->host_id < rhs->host_id;
+                  }
+                  if (lhs->segment_id != rhs->segment_id) {
+                      return lhs->segment_id < rhs->segment_id;
+                  }
+                  return lhs->name < rhs->name;
+              });
+
     std::unordered_map<std::string, size_t> host_index;
     std::unordered_map<std::string, size_t> domain_index;
-    for (const auto* segment : eligible) {
-        if (segment->largest_free < max_inclusive) {
-            continue;
-        }
+    for (const auto* segment : class_segments) {
         auto [it, inserted] =
             host_index.emplace(segment->host_id, host_index.size());
         if (inserted) {
@@ -358,39 +430,91 @@ std::optional<SlotPlan> RoundSlots(const ClassTopology& topology,
     return plan;
 }
 
-std::optional<std::vector<size_t>> PickGroupsForRow(
-    const std::vector<size_t>& remaining_slots, size_t rows_left,
-    uint32_t replica_num) {
-    std::vector<size_t> candidates;
-    candidates.reserve(remaining_slots.size());
+// ---------------------------------------------------------------------
+// Row construction.
+//
+// Domain level (pick R distinct domains for one row) is the only place
+// where a combinatorial "no repeat within this row" constraint exists,
+// so it keeps the Havel-Hakimi feasibility guarantee from the original
+// implementation: any domain whose remaining quota equals the number of
+// rows left *must* be placed now, or a later row becomes infeasible.
+// Domains that can still be deferred are chosen among by CRUSH-style
+// weighted sampling instead of a flat "largest remaining first" sort --
+// this keeps the same worst-case feasibility guarantee while removing
+// the artificial bias toward packing high-quota domains into the
+// earliest pt_ids.
+//
+// Host and Segment level each only ever pick *one* item per call, with
+// no cross-item constraint. Because a domain's remaining quota always
+// equals the sum of its member Hosts' remaining quotas (they are
+// decremented together on every pick), and likewise a Host's remaining
+// quota always equals the sum of its member Segments' remaining quotas,
+// any pick among currently-nonzero candidates is safe: by induction the
+// full quota is always exhausted exactly by the final row, regardless of
+// which specific candidate is chosen at each step. So no forced/free
+// split is needed at these two levels -- a plain CRUSH-style weighted
+// draw is both correct and sufficient.
+// ---------------------------------------------------------------------
+
+constexpr uint32_t kDomainLevel = 0;
+constexpr uint32_t kHostLevel = 1;
+constexpr uint32_t kSegmentLevel = 2;
+
+std::optional<std::vector<size_t>> PickRowGroups(
+    const std::vector<uint64_t>& remaining_slots, size_t rows_left,
+    uint32_t replica_num, uint64_t row_seed,
+    const std::vector<std::string>& stable_keys) {
+    std::vector<size_t> forced;
+    std::vector<size_t> deferrable;
     for (size_t group = 0; group < remaining_slots.size(); ++group) {
-        if (remaining_slots[group] == 0) {
+        const uint64_t remaining = remaining_slots[group];
+        if (remaining == 0) {
             continue;
         }
-        if (remaining_slots[group] > rows_left) {
-            return std::nullopt;
+        if (remaining > rows_left) {
+            return std::nullopt;  // infeasible no matter the ordering
         }
-        candidates.push_back(group);
+        if (remaining == rows_left) {
+            forced.push_back(group);
+        } else {
+            deferrable.push_back(group);
+        }
     }
-    if (candidates.size() < replica_num) {
+    if (forced.size() > replica_num ||
+        forced.size() + deferrable.size() < replica_num) {
         return std::nullopt;
     }
 
-    // Havel-Hakimi style construction: consume the groups with the largest
-    // remaining quotas first. This deterministically preserves feasibility
-    // for the following rows and never selects one group twice in a row.
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [&remaining_slots](size_t lhs, size_t rhs) {
-                         return remaining_slots[lhs] > remaining_slots[rhs];
-                     });
-    std::vector<size_t> picked_groups(candidates.begin(),
-                                      candidates.begin() + replica_num);
-    return picked_groups;
+    std::vector<size_t> picked = std::move(forced);
+    const size_t need = replica_num - picked.size();
+    if (need > 0) {
+        std::vector<std::pair<double, size_t>> scored;
+        scored.reserve(deferrable.size());
+        for (size_t group : deferrable) {
+            const uint64_t key =
+                deterministicRandomHashString(0, stable_keys[group]);
+            const double score = deterministicWeightedScore(
+                row_seed, kDomainLevel, key,
+                static_cast<double>(remaining_slots[group]));
+            scored.emplace_back(score, group);
+        }
+        std::partial_sort(
+            scored.begin(), scored.begin() + need, scored.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.first != rhs.first ? lhs.first > rhs.first
+                                              : lhs.second < rhs.second;
+            });
+        for (size_t i = 0; i < need; ++i) {
+            picked.push_back(scored[i].second);
+        }
+    }
+    std::sort(picked.begin(), picked.end());
+    return picked;
 }
 
 std::optional<std::vector<PtEntry>> BuildRows(
     const ClassTopology& topology, const SlotPlan& slots,
-    const PtBuildConfig& config) {
+    const PtBuildConfig& config, uint64_t policy_seed) {
     const uint64_t total_slots =
         static_cast<uint64_t>(config.pt_count) * config.replica_num;
     const uint64_t planned_slots = std::accumulate(
@@ -399,65 +523,92 @@ std::optional<std::vector<PtEntry>> BuildRows(
         return std::nullopt;
     }
 
-    std::vector<std::vector<size_t>> host_queues(
-        topology.host_segments.size());
-    for (size_t i = 0; i < topology.segments.size(); ++i) {
-        host_queues[topology.segment_host[i]].insert(
-            host_queues[topology.segment_host[i]].end(),
-            static_cast<size_t>(slots.segment_slots[i]), i);
-    }
-    for (size_t h = 0; h < host_queues.size(); ++h) {
-        randomShuffle(host_queues[h].begin(), host_queues[h].end());
-        if (host_queues[h].size() != slots.host_slots[h] ||
-            host_queues[h].size() > config.pt_count) {
-            return std::nullopt;
-        }
-    }
+    std::vector<uint64_t> domain_remaining(slots.domain_slots.begin(),
+                                           slots.domain_slots.end());
+    std::vector<uint64_t> host_remaining(slots.host_slots.begin(),
+                                         slots.host_slots.end());
+    std::vector<uint64_t> segment_remaining(slots.segment_slots.begin(),
+                                            slots.segment_slots.end());
 
-    std::vector<size_t> domain_remaining(slots.domain_slots.begin(),
-                                         slots.domain_slots.end());
-    for (size_t d = 0; d < topology.domain_hosts.size(); ++d) {
-        size_t host_slots = 0;
-        for (const size_t h : topology.domain_hosts[d]) {
-            host_slots += host_queues[h].size();
-        }
-        if (host_slots != domain_remaining[d] ||
-            domain_remaining[d] > config.pt_count) {
-            return std::nullopt;
-        }
+    // Stable per-host key for hashing: any Segment on the Host carries its
+    // host_id, so reuse the first one. Segment-level keys use segment_id
+    // directly. Using stable IDs (not vector indices) means the selection
+    // pattern for a given physical Host/Segment is comparable across
+    // rebuilds, not an artifact of topology-vector ordering.
+    std::vector<std::string> host_keys(topology.host_segments.size());
+    for (size_t h = 0; h < topology.host_segments.size(); ++h) {
+        host_keys[h] =
+            topology.segments[topology.host_segments[h].front()]->host_id;
     }
 
     std::vector<PtEntry> entries;
     entries.reserve(config.pt_count);
     for (uint32_t pt_id = 0; pt_id < config.pt_count; ++pt_id) {
         const size_t rows_left = static_cast<size_t>(config.pt_count) - pt_id;
-        auto picked_domains = PickGroupsForRow(
-            domain_remaining, rows_left, config.replica_num);
+        const uint64_t row_seed =
+            deterministicRandomHash(policy_seed, pt_id);
+
+        auto picked_domains = PickRowGroups(domain_remaining, rows_left,
+                                            config.replica_num, row_seed,
+                                            topology.domain_ids);
         if (!picked_domains) {
             return std::nullopt;
         }
+
         PtEntry entry;
         entry.pt_id = pt_id;
         entry.replicas.reserve(config.replica_num);
         for (const size_t d : *picked_domains) {
             size_t selected_host = SIZE_MAX;
-            for (const size_t candidate : topology.domain_hosts[d]) {
-                if (host_queues[candidate].empty()) {
+            double best_host_score = -std::numeric_limits<double>::infinity();
+            for (const size_t h : topology.domain_hosts[d]) {
+                if (host_remaining[h] == 0) {
                     continue;
                 }
-                if (selected_host == SIZE_MAX ||
-                    host_queues[candidate].size() >
-                        host_queues[selected_host].size()) {
-                    selected_host = candidate;
+                const uint64_t key =
+                    deterministicRandomHashString(0, host_keys[h]);
+                const double score = deterministicWeightedScore(
+                    row_seed, kHostLevel, key,
+                    static_cast<double>(host_remaining[h]));
+                if (score > best_host_score ||
+                    (score == best_host_score && h < selected_host)) {
+                    best_host_score = score;
+                    selected_host = h;
                 }
             }
             if (selected_host == SIZE_MAX) {
                 return std::nullopt;
             }
-            const size_t segment_index = host_queues[selected_host].back();
-            host_queues[selected_host].pop_back();
+
+            size_t selected_segment = SIZE_MAX;
+            double best_segment_score =
+                -std::numeric_limits<double>::infinity();
+            for (const size_t i : topology.host_segments[selected_host]) {
+                if (segment_remaining[i] == 0) {
+                    continue;
+                }
+                const UUID& segment_id = topology.segments[i]->segment_id;
+                const uint64_t key = deterministicRandomHash(
+                    segment_id.first, segment_id.second);
+                const double score = deterministicWeightedScore(
+                    row_seed, kSegmentLevel, key,
+                    static_cast<double>(segment_remaining[i]));
+                if (score > best_segment_score ||
+                    (score == best_segment_score && i < selected_segment)) {
+                    best_segment_score = score;
+                    selected_segment = i;
+                }
+            }
+            if (selected_segment == SIZE_MAX) {
+                return std::nullopt;
+            }
+
             --domain_remaining[d];
-            const PtSegmentSnapshot* segment = topology.segments[segment_index];
+            --host_remaining[selected_host];
+            --segment_remaining[selected_segment];
+
+            const PtSegmentSnapshot* segment =
+                topology.segments[selected_segment];
             entry.replicas.push_back(PtTarget{
                 segment->segment_id, segment->name, segment->host_id,
                 topology.host_rack_ids[selected_host],
@@ -465,12 +616,20 @@ std::optional<std::vector<PtEntry>> BuildRows(
         }
         entries.push_back(std::move(entry));
     }
-    if (std::any_of(host_queues.begin(), host_queues.end(),
-                    [](const auto& queue) { return !queue.empty(); })) {
-        return std::nullopt;
-    }
-    if (std::any_of(domain_remaining.begin(), domain_remaining.end(),
-                    [](size_t remaining) { return remaining != 0; })) {
+
+    // Every remaining-count array must be exactly drained. If this ever
+    // fails it means the invariant argued above (domain quota == sum of
+    // member Host quotas == sum of member Segment quotas, decremented in
+    // lockstep) was violated by a bug upstream in SlotPlan, not by the
+    // sampling choices made here.
+    const bool fully_drained =
+        std::all_of(domain_remaining.begin(), domain_remaining.end(),
+                   [](uint64_t r) { return r == 0; }) &&
+        std::all_of(host_remaining.begin(), host_remaining.end(),
+                   [](uint64_t r) { return r == 0; }) &&
+        std::all_of(segment_remaining.begin(), segment_remaining.end(),
+                   [](uint64_t r) { return r == 0; });
+    if (!fully_drained) {
         return std::nullopt;
     }
     return entries;
@@ -540,7 +699,7 @@ std::optional<PtView> PtViewBuilder::Build(
     view.created_at_ns = view.epoch;
     view.pt_count = config.pt_count;
     view.configured_replica_num = config.replica_num;
-    view.seed = config.seed ? config.seed : view.epoch;
+    view.seed = config.seed ? config.seed : kDefaultPtSeed;
 
     uint64_t min_exclusive = 0;
     for (const uint64_t max_inclusive : class_bounds) {
@@ -586,7 +745,13 @@ bool PtViewBuilder::BuildPolicy(
         return false;
     }
 
-    auto rows = BuildRows(*topology, *slots, config);
+    // Salt the seed with this policy's upper bound so that different size
+    // classes never draw from identical (row_seed, level_tag, key) tuples
+    // even when their eligible-topology subsets overlap.
+    const uint64_t view_seed = config.seed ? config.seed : kDefaultPtSeed;
+    const uint64_t policy_seed =
+        deterministicRandomHash(view_seed, max_inclusive);
+    auto rows = BuildRows(*topology, *slots, config, policy_seed);
     if (!rows) {
         return false;
     }

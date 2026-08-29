@@ -80,14 +80,6 @@ TEST(RandomTest, RejectsInvalidBounds) {
     EXPECT_THROW(randomUniform(2, 1, engine), std::invalid_argument);
 }
 
-TEST(RandomTest, ShufflePreservesElements) {
-    std::vector<int> values{1, 2, 3, 4, 5};
-    std::mt19937_64 engine(42);
-    randomShuffle(values.begin(), values.end(), engine);
-    std::sort(values.begin(), values.end());
-    EXPECT_EQ(values, (std::vector<int>{1, 2, 3, 4, 5}));
-}
-
 TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(999), "999 B");
     EXPECT_EQ(byte_size_to_string(2048), "2.00 KB");
