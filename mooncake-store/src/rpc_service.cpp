@@ -1555,6 +1555,11 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
     return master_service_.QuerySegments(segment);
 }
 
+tl::expected<std::optional<MasterService::PtViewDetail>, ErrorCode>
+WrappedMasterService::GetPtViewForAdmin() {
+    return master_service_.GetPtViewDetail();
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");

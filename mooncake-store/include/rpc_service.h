@@ -209,6 +209,9 @@ class WrappedMasterService {
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
+    tl::expected<std::optional<MasterService::PtViewDetail>, ErrorCode>
+    GetPtViewForAdmin();
+
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 

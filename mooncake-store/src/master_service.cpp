@@ -3016,6 +3016,50 @@ auto MasterService::GetSegmentsDetail()
     return result;
 }
 
+auto MasterService::GetPtViewDetail()
+    -> tl::expected<std::optional<PtViewDetail>, ErrorCode> {
+    if (!enable_nof_pt_allocation_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
+    auto view = nof_segment_manager_.GetPtViewManager().GetActiveView();
+    if (!view) {
+        return std::nullopt;
+    }
+
+    PtViewDetail detail;
+    detail.epoch = view->epoch;
+    detail.resource_epoch = view->resource_epoch;
+    detail.created_at_ns = view->created_at_ns;
+    detail.pt_count = view->pt_count;
+    detail.configured_replica_num = view->configured_replica_num;
+    detail.seed = view->seed;
+    detail.policies.reserve(view->policies.size());
+    for (const auto& policy : view->policies) {
+        PtPolicyDetail policy_detail;
+        policy_detail.min_aligned_request_size_exclusive =
+            policy.min_aligned_request_size_exclusive;
+        policy_detail.max_aligned_request_size_inclusive =
+            policy.max_aligned_request_size_inclusive;
+        policy_detail.entries.reserve(policy.entries.size());
+        for (const auto& entry : policy.entries) {
+            PtEntryDetail entry_detail;
+            entry_detail.pt_id = entry.pt_id;
+            entry_detail.replicas.reserve(entry.replicas.size());
+            for (const auto& replica : entry.replicas) {
+                PtTargetDetail target_detail;
+                target_detail.segment_id = UuidToString(replica.region_id);
+                target_detail.name = replica.name;
+                target_detail.host_id = replica.host_id;
+                entry_detail.replicas.push_back(std::move(target_detail));
+            }
+            policy_detail.entries.push_back(std::move(entry_detail));
+        }
+        detail.policies.push_back(std::move(policy_detail));
+    }
+    return detail;
+}
+
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();

@@ -779,6 +779,90 @@ void MasterAdminServer::HandleQuerySegment(
     });
 }
 
+struct HttpPtTarget {
+    std::string segment_id;
+    std::string name;
+    std::string host_id;
+};
+YLT_REFL(HttpPtTarget, segment_id, name, host_id);
+
+struct HttpPtEntry {
+    uint32_t pt_id{0};
+    std::vector<HttpPtTarget> replicas;
+};
+YLT_REFL(HttpPtEntry, pt_id, replicas);
+
+struct HttpPtPolicy {
+    uint64_t min_aligned_request_size_exclusive{0};
+    uint64_t max_aligned_request_size_inclusive{0};
+    std::vector<HttpPtEntry> entries;
+};
+YLT_REFL(HttpPtPolicy, min_aligned_request_size_exclusive,
+         max_aligned_request_size_inclusive, entries);
+
+struct HttpPtViewResponse {
+    bool success{true};
+    bool has_active_view{false};
+    uint64_t epoch{0};
+    uint64_t resource_epoch{0};
+    uint64_t created_at_ns{0};
+    uint32_t pt_count{0};
+    uint32_t configured_replica_num{0};
+    uint64_t seed{0};
+    std::vector<HttpPtPolicy> policies;
+};
+YLT_REFL(HttpPtViewResponse, success, has_active_view, epoch, resource_epoch,
+         created_at_ns, pt_count, configured_replica_num, seed, policies);
+
+void MasterAdminServer::HandleGetPtView(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetPtViewForAdmin();
+        if (!result) {
+            WriteErrorResponse(
+                resp, ErrorCodeToHttpStatus(result.error()), result.error(),
+                "PT placement lane is not enabled");
+            return;
+        }
+
+        HttpPtViewResponse payload;
+        const auto& view = result.value();
+        if (view) {
+            payload.has_active_view = true;
+            payload.epoch = view->epoch;
+            payload.resource_epoch = view->resource_epoch;
+            payload.created_at_ns = view->created_at_ns;
+            payload.pt_count = view->pt_count;
+            payload.configured_replica_num = view->configured_replica_num;
+            payload.seed = view->seed;
+            payload.policies.reserve(view->policies.size());
+            for (const auto& policy : view->policies) {
+                HttpPtPolicy http_policy;
+                http_policy.min_aligned_request_size_exclusive =
+                    policy.min_aligned_request_size_exclusive;
+                http_policy.max_aligned_request_size_inclusive =
+                    policy.max_aligned_request_size_inclusive;
+                http_policy.entries.reserve(policy.entries.size());
+                for (const auto& entry : policy.entries) {
+                    HttpPtEntry http_entry;
+                    http_entry.pt_id = entry.pt_id;
+                    http_entry.replicas.reserve(entry.replicas.size());
+                    for (const auto& replica : entry.replicas) {
+                        HttpPtTarget http_target;
+                        http_target.segment_id = replica.segment_id;
+                        http_target.name = replica.name;
+                        http_target.host_id = replica.host_id;
+                        http_entry.replicas.push_back(std::move(http_target));
+                    }
+                    http_policy.entries.push_back(std::move(http_entry));
+                }
+                payload.policies.push_back(std::move(http_policy));
+            }
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpCreateDrainJobResponse {
     bool success{false};
     std::string job_id;
@@ -1259,6 +1343,11 @@ void MasterAdminServer::RegisterHandler() {
         "/query_segment",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleQuerySegment(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/pt_view",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetPtView(req, resp);
         });
     http_server_.set_http_handler<POST>(
         "/api/v1/drain_jobs",

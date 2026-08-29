@@ -1284,6 +1284,147 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     admin.Stop();
 }
 
+// -----------------------------------------------------------------------
+// GET /api/v1/pt_view
+// -----------------------------------------------------------------------
+
+namespace {
+
+struct HttpPtViewTestTarget {
+    std::string segment_id;
+    std::string name;
+    std::string host_id;
+};
+YLT_REFL(HttpPtViewTestTarget, segment_id, name, host_id);
+
+struct HttpPtViewTestEntry {
+    uint32_t pt_id{0};
+    std::vector<HttpPtViewTestTarget> replicas;
+};
+YLT_REFL(HttpPtViewTestEntry, pt_id, replicas);
+
+struct HttpPtViewTestPolicy {
+    uint64_t min_aligned_request_size_exclusive{0};
+    uint64_t max_aligned_request_size_inclusive{0};
+    std::vector<HttpPtViewTestEntry> entries;
+};
+YLT_REFL(HttpPtViewTestPolicy, min_aligned_request_size_exclusive,
+         max_aligned_request_size_inclusive, entries);
+
+struct HttpPtViewTestResponse {
+    bool success{false};
+    bool has_active_view{false};
+    uint64_t epoch{0};
+    uint64_t resource_epoch{0};
+    uint64_t created_at_ns{0};
+    uint32_t pt_count{0};
+    uint32_t configured_replica_num{0};
+    uint64_t seed{0};
+    std::vector<HttpPtViewTestPolicy> policies;
+};
+YLT_REFL(HttpPtViewTestResponse, success, has_active_view, epoch,
+         resource_epoch, created_at_ns, pt_count, configured_replica_num, seed,
+         policies);
+
+NoFSegment MakePtViewTestSegment(std::string name, std::string host_id,
+                                  std::string endpoint, uintptr_t base) {
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = std::move(name);
+    segment.base = base;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = std::move(endpoint);
+    segment.host_id = std::move(host_id);
+    return segment;
+}
+
+}  // namespace
+
+TEST_F(MasterAdminServerTest, PtViewDisabledReturnsConflict) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto resp = HttpGet(port, "/api/v1/pt_view");
+    EXPECT_EQ(resp.http_status, 409);
+    EXPECT_NE(resp.body.find("PT placement lane is not enabled"),
+              std::string::npos);
+    HttpErrorResponse parsed;
+    struct_json::from_json(parsed, resp.body);
+    EXPECT_EQ(parsed.error_code, toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE));
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, PtViewReturnsPublishedView) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_nof_pt_allocation = true;
+    svc_config.nof_pt_count = 128;
+    svc_config.nof_pt_replica_num = 2;
+    svc_config.nof_pt_rebuild_interval_ms = 100;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    UUID client_id = generate_uuid();
+    const std::string seg_a_name = "pt_view_seg_a";
+    const std::string seg_a_host = "pt_host_a";
+    NoFSegment seg_a =
+        MakePtViewTestSegment(seg_a_name, seg_a_host, "127.0.0.1:9999",
+                              0x800000000);
+    NoFSegment seg_b = MakePtViewTestSegment(
+        "pt_view_seg_b", "pt_host_b", "127.0.0.1:9998", 0x900000000);
+    ASSERT_TRUE(service->MountNoFSegment(seg_a, client_id).has_value());
+    ASSERT_TRUE(service->MountNoFSegment(seg_b, client_id).has_value());
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    // The rebuild scheduler publishes asynchronously after mount events;
+    // poll until the view is available (bounded by nof_pt_rebuild_interval).
+    HttpPtViewTestResponse parsed;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool has_view = false;
+    do {
+        auto resp = HttpGet(port, "/api/v1/pt_view");
+        ASSERT_EQ(resp.http_status, 200);
+        struct_json::from_json(parsed, resp.body);
+        if (parsed.has_active_view) {
+            has_view = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(has_view);
+
+    EXPECT_TRUE(parsed.success);
+    EXPECT_GT(parsed.epoch, 0u);
+    EXPECT_GT(parsed.created_at_ns, 0u);
+    EXPECT_EQ(parsed.pt_count, 128u);
+    EXPECT_EQ(parsed.configured_replica_num, 2u);
+    ASSERT_FALSE(parsed.policies.empty());
+    EXPECT_FALSE(parsed.policies[0].entries.empty());
+    ASSERT_EQ(parsed.policies[0].entries[0].replicas.size(), 2u);
+    const auto& first_replica = parsed.policies[0].entries[0].replicas[0];
+    EXPECT_FALSE(first_replica.segment_id.empty());
+    EXPECT_FALSE(first_replica.name.empty());
+    EXPECT_FALSE(first_replica.host_id.empty());
+
+    admin.Stop();
+}
+
 }  // namespace test
 }  // namespace mooncake
 

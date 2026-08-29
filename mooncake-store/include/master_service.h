@@ -355,6 +355,47 @@ class MasterService {
         -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>;
 
     /**
+     * @brief Detailed snapshot of the active placement-table (PT) view for
+     * the NoF PT placement lane (RFC 0005). Mirrors PtView with UUIDs
+     * rendered as strings so admin/DFX callers can consume it directly.
+     */
+    struct PtTargetDetail {
+        std::string segment_id;
+        std::string name;
+        std::string host_id;
+    };
+
+    struct PtEntryDetail {
+        uint32_t pt_id{0};
+        std::vector<PtTargetDetail> replicas;
+    };
+
+    struct PtPolicyDetail {
+        uint64_t min_aligned_request_size_exclusive{0};
+        uint64_t max_aligned_request_size_inclusive{0};
+        std::vector<PtEntryDetail> entries;
+    };
+
+    struct PtViewDetail {
+        uint64_t epoch{0};
+        uint64_t resource_epoch{0};
+        uint64_t created_at_ns{0};
+        uint32_t pt_count{0};
+        uint32_t configured_replica_num{0};
+        uint64_t seed{0};
+        std::vector<PtPolicyDetail> policies;
+    };
+
+    /**
+     * @brief Get the active PT view snapshot for DFX queries.
+     * @return std::nullopt when the PT lane is enabled but no view has been
+     * published yet; ErrorCode::UNAVAILABLE_IN_CURRENT_MODE when the PT lane
+     * is disabled.
+     */
+    auto GetPtViewDetail()
+        -> tl::expected<std::optional<PtViewDetail>, ErrorCode>;
+
+    /**
      * @brief Query a segment's capacity and used size in bytes.
      * Conductor should use these information to schedule new requests.
      * @return ErrorCode::OK if exists

@@ -390,6 +390,7 @@ std::optional<PtView> PtViewBuilder::Build(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+    view.created_at_ns = view.epoch;
     view.pt_count = config.pt_count;
     view.configured_replica_num = config.replica_num;
     view.seed = config.seed ? config.seed : view.epoch;
