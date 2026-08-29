@@ -8,12 +8,13 @@
 #include "segment.h"
 #include "placement/pt_view.h"
 #include "placement/pt_view_builder.h"
+#include "placement/pt_rebuild_policy.h"
 #include "types.h"
 
 namespace mooncake {
 
 // Background PT view scheduler (RFC 0005 §9.1). Runs a single-flight builder
-// thread on a fixed interval and on-demand events (mount/unmount/topology
+// thread on an adaptive interval and on-demand events (mount/unmount/topology
 // change). It is created only when foreground PT allocation is enabled.
 class PtRebuildScheduler final {
    public:
@@ -26,6 +27,9 @@ class PtRebuildScheduler final {
                        std::chrono::milliseconds rebuild_interval)
         : manager_(manager),
           build_config_(build_config),
+          cadence_(rebuild_interval,
+                   std::min(rebuild_interval,
+                            std::chrono::milliseconds(1000))),
           worker_([this] { RebuildOnce(); }, rebuild_interval) {}
     ~PtRebuildScheduler() { Stop(); }
 
@@ -70,6 +74,20 @@ class PtRebuildScheduler final {
    private:
     void RebuildOnce() {
         std::vector<PtSegmentSnapshot> segments = CollectSegments();
+        const PtBalanceSummary balance = ComputePtBalanceSummary(segments);
+        const auto cadence = cadence_.Observe(balance);
+        worker_.SetPeriodicInterval(cadence.next_interval);
+
+        auto& view_manager = manager_.GetPtViewManager();
+        if (view_manager.GetActiveView() && !cadence.materially_changed) {
+            VLOG(1) << "PtViewBuilder: skip unchanged physical state, mode="
+                    << PtRebuildModeName(cadence.mode)
+                    << ", utilization_spread="
+                    << balance.utilization_spread
+                    << ", eligible=" << balance.eligible_segments;
+            return;
+        }
+
         PtBuildStats stats;
         auto view = PtViewBuilder::Build(segments, build_config_, &stats);
         if (!view) {
@@ -77,21 +95,28 @@ class PtRebuildScheduler final {
                          << stats.total_segments
                          << ", topology_incomplete="
                          << stats.topology_incomplete
-                         << ", eligible=" << stats.eligible_segments;
+                         << ", eligible=" << stats.eligible_segments
+                         << ", mode=" << PtRebuildModeName(cadence.mode)
+                         << ", utilization_spread="
+                         << balance.utilization_spread;
             return;
         }
-        auto& view_manager = manager_.GetPtViewManager();
         view_manager.Publish(std::make_shared<const PtView>(std::move(*view)));
         LOG(INFO) << "PtViewBuilder: published view, epoch="
                   << view_manager.GetActiveView()->epoch
                   << ", policies=" << stats.policies_built
                   << ", topology_incomplete=" << stats.topology_incomplete
                   << ", eligible=" << stats.eligible_segments
-                  << ", duration_ns=" << stats.build_duration_ns;
+                  << ", duration_ns=" << stats.build_duration_ns
+                  << ", mode=" << PtRebuildModeName(cadence.mode)
+                  << ", next_interval_ms=" << cadence.next_interval.count()
+                  << ", utilization_spread="
+                  << balance.utilization_spread;
     }
 
     NoFSegmentManager& manager_;
     const PtBuildConfig build_config_;
+    PtRebuildCadence cadence_;
     BackgroundWorker worker_;
 };
 

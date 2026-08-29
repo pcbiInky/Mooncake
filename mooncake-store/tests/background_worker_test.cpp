@@ -117,4 +117,32 @@ TEST(BackgroundWorkerTest, RejectsNonPositivePeriodicInterval) {
         std::invalid_argument);
 }
 
+TEST(BackgroundWorkerTest, PeriodicIntervalCanBeUpdatedWhileRunning) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t callback_count = 0;
+    BackgroundWorker worker(
+        [&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++callback_count;
+            cv.notify_all();
+        },
+        std::chrono::hours(1));
+
+    worker.Start();
+    worker.SetPeriodicInterval(std::chrono::milliseconds(10));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return callback_count > 0; }));
+    }
+    worker.Stop();
+}
+
+TEST(BackgroundWorkerTest, IntervalUpdateRequiresPeriodicMode) {
+    BackgroundWorker worker([] {});
+    EXPECT_THROW(worker.SetPeriodicInterval(std::chrono::milliseconds(10)),
+                 std::logic_error);
+}
+
 }  // namespace mooncake::test
