@@ -15,7 +15,9 @@ NoFRegisterClient::~NoFRegisterClient() = default;
 int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
                                     const std::string &traddr, size_t trsvcid,
                                     uintptr_t base, size_t size,
-                                    const std::string &master_server_addr) {
+                                    const std::string &master_server_addr,
+                                    const std::string &host_id,
+                                    const std::string &rack_id) {
     LOG(INFO) << "Registering SSD: nqn=" << nqn << ",nsid=" << nsid
               << ",traddr=" << traddr << ",trsvcid=" << trsvcid
               << ",master=" << master_server_addr << ",base=" << base
@@ -49,10 +51,11 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
     segment.id = generate_uuid();
     segment.name = te_endpoint;
     segment.te_endpoint = te_endpoint;
-    // The NoF serving address is a deployment-level node identity in the
-    // first version. Reuse the existing normalizer so callers do not need a
-    // new host_id parameter and all namespaces on one traddr share a domain.
-    segment.host_id = ResolveMooncakeHostId(traddr);
+    // Prefer the deployment-provided physical Host identity so multiple NICs
+    // on one server share a Host. Fall back to the normalized transport
+    // address for legacy callers.
+    segment.host_id =
+        host_id.empty() ? ResolveMooncakeHostId(traddr) : host_id;
     if (segment.host_id.empty()) {
         LOG(WARNING)
             << "NoF traddr cannot be resolved to a host_id; segment will "
@@ -60,7 +63,12 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
                "and be excluded from PT views";
     } else {
         LOG(INFO) << "Segment host_id resolved as '" << segment.host_id
-                  << "' (PT failure domain)";
+                  << "'";
+    }
+    segment.rack_id = rack_id;
+    if (!segment.rack_id.empty()) {
+        LOG(INFO) << "Segment rack_id resolved as '" << segment.rack_id
+                  << "' (PT rack failure domain)";
     }
     auto mount_result = master_client_.MountNoFSegment(segment);
     if (!mount_result) {

@@ -3051,6 +3051,9 @@ auto MasterService::GetPtViewDetail()
                 target_detail.segment_id = UuidToString(replica.region_id);
                 target_detail.name = replica.name;
                 target_detail.host_id = replica.host_id;
+                target_detail.rack_id = replica.rack_id;
+                target_detail.failure_domain_id =
+                    replica.failure_domain_id;
                 entry_detail.replicas.push_back(std::move(target_detail));
             }
             policy_detail.entries.push_back(std::move(entry_detail));

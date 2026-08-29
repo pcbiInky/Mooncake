@@ -1071,7 +1071,7 @@ TEST_F(SegmentTest, QuerySegments) {
 namespace {
 
 NoFSegment MakePtNoFSegment(size_t index, std::string name,
-                            std::string host) {
+                            std::string host, std::string rack = "") {
     NoFSegment segment;
     segment.id = generate_uuid();
     segment.name = std::move(name);
@@ -1079,6 +1079,7 @@ NoFSegment MakePtNoFSegment(size_t index, std::string name,
     segment.size = 16 * 1024 * 1024;
     segment.te_endpoint = segment.name + "-nof-endpoint";
     segment.host_id = std::move(host);
+    segment.rack_id = std::move(rack);
     return segment;
 }
 
@@ -1087,7 +1088,7 @@ NoFSegment MakePtNoFSegment(size_t index, std::string name,
 TEST_F(SegmentTest, NoFSpaceReportsTrackMountedSegments) {
     NoFSegmentManager manager(BufferAllocatorType::OFFSET);
     const UUID client = generate_uuid();
-    auto a = MakePtNoFSegment(0, "nof-a", "host-a");
+    auto a = MakePtNoFSegment(0, "nof-a", "host-a", "rack-a");
     auto b = MakePtNoFSegment(1, "nof-b", "host-b");
     {
         auto access = manager.getNoFSegmentAccess();
@@ -1104,10 +1105,12 @@ TEST_F(SegmentTest, NoFSpaceReportsTrackMountedSegments) {
         if (report.segment_id == a.id) {
             EXPECT_EQ(report.name, a.name);
             EXPECT_EQ(report.host_id, "host-a");
+            EXPECT_EQ(report.rack_id, "rack-a");
         } else {
             EXPECT_EQ(report.segment_id, b.id);
             EXPECT_EQ(report.name, b.name);
             EXPECT_EQ(report.host_id, "host-b");
+            EXPECT_TRUE(report.rack_id.empty());
         }
     }
 }

@@ -783,8 +783,11 @@ struct HttpPtTarget {
     std::string segment_id;
     std::string name;
     std::string host_id;
+    std::string rack_id;
+    std::string failure_domain_id;
 };
-YLT_REFL(HttpPtTarget, segment_id, name, host_id);
+YLT_REFL(HttpPtTarget, segment_id, name, host_id, rack_id,
+         failure_domain_id);
 
 struct HttpPtEntry {
     uint32_t pt_id{0};
@@ -852,6 +855,9 @@ void MasterAdminServer::HandleGetPtView(
                         http_target.segment_id = replica.segment_id;
                         http_target.name = replica.name;
                         http_target.host_id = replica.host_id;
+                        http_target.rack_id = replica.rack_id;
+                        http_target.failure_domain_id =
+                            replica.failure_domain_id;
                         http_entry.replicas.push_back(std::move(http_target));
                     }
                     http_policy.entries.push_back(std::move(http_entry));

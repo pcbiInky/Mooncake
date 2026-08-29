@@ -497,6 +497,7 @@ class NoFSegmentManager {
         UUID segment_id;
         std::string name;
         std::string host_id;
+        std::string rack_id;
         uint64_t capacity{0};
         uint64_t used{0};
         uint64_t largest_free{0};

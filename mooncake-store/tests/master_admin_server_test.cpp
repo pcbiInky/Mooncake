@@ -1294,8 +1294,11 @@ struct HttpPtViewTestTarget {
     std::string segment_id;
     std::string name;
     std::string host_id;
+    std::string rack_id;
+    std::string failure_domain_id;
 };
-YLT_REFL(HttpPtViewTestTarget, segment_id, name, host_id);
+YLT_REFL(HttpPtViewTestTarget, segment_id, name, host_id, rack_id,
+         failure_domain_id);
 
 struct HttpPtViewTestEntry {
     uint32_t pt_id{0};
@@ -1326,8 +1329,10 @@ YLT_REFL(HttpPtViewTestResponse, success, has_active_view, epoch,
          resource_epoch, created_at_ns, pt_count, configured_replica_num, seed,
          policies);
 
+#ifdef USE_NOF
 NoFSegment MakePtViewTestSegment(std::string name, std::string host_id,
-                                  std::string endpoint, uintptr_t base) {
+                                 std::string endpoint, uintptr_t base,
+                                 std::string rack_id = "") {
     NoFSegment segment;
     segment.id = generate_uuid();
     segment.name = std::move(name);
@@ -1335,8 +1340,10 @@ NoFSegment MakePtViewTestSegment(std::string name, std::string host_id,
     segment.size = 1024 * 1024 * 16;
     segment.te_endpoint = std::move(endpoint);
     segment.host_id = std::move(host_id);
+    segment.rack_id = std::move(rack_id);
     return segment;
 }
+#endif
 
 }  // namespace
 
@@ -1364,6 +1371,7 @@ TEST_F(MasterAdminServerTest, PtViewDisabledReturnsConflict) {
     admin.Stop();
 }
 
+#ifdef USE_NOF
 TEST_F(MasterAdminServerTest, PtViewReturnsPublishedView) {
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
@@ -1379,9 +1387,10 @@ TEST_F(MasterAdminServerTest, PtViewReturnsPublishedView) {
     const std::string seg_a_host = "pt_host_a";
     NoFSegment seg_a =
         MakePtViewTestSegment(seg_a_name, seg_a_host, "127.0.0.1:9999",
-                              0x800000000);
+                              0x800000000, "pt_rack_a");
     NoFSegment seg_b = MakePtViewTestSegment(
-        "pt_view_seg_b", "pt_host_b", "127.0.0.1:9998", 0x900000000);
+        "pt_view_seg_b", "pt_host_b", "127.0.0.1:9998", 0x900000000,
+        "pt_rack_b");
     ASSERT_TRUE(service->MountNoFSegment(seg_a, client_id).has_value());
     ASSERT_TRUE(service->MountNoFSegment(seg_b, client_id).has_value());
 
@@ -1421,9 +1430,12 @@ TEST_F(MasterAdminServerTest, PtViewReturnsPublishedView) {
     EXPECT_FALSE(first_replica.segment_id.empty());
     EXPECT_FALSE(first_replica.name.empty());
     EXPECT_FALSE(first_replica.host_id.empty());
+    EXPECT_FALSE(first_replica.rack_id.empty());
+    EXPECT_FALSE(first_replica.failure_domain_id.empty());
 
     admin.Stop();
 }
+#endif
 
 }  // namespace test
 }  // namespace mooncake

@@ -20,6 +20,9 @@ struct PtSegmentSnapshot {
     UUID segment_id;
     std::string name;
     std::string host_id;  // empty => TOPOLOGY_INCOMPLETE, excluded from PT
+    // Optional rack / power-domain identity. Missing rack_id falls back to
+    // host_id for best-effort failure-domain placement.
+    std::string rack_id;
     uint64_t capacity{0};
     uint64_t used{0};
     uint64_t largest_free{0};
@@ -27,6 +30,18 @@ struct PtSegmentSnapshot {
     // builder excludes such segments.
     bool unknown_capacity{false};
 };
+
+// Prefixing the value preserves the domain type and prevents a host ID from
+// accidentally colliding with a rack ID. host_id remains independently
+// required for Host k/N balancing and same-Host replica exclusion.
+inline std::string EffectiveFailureDomain(
+    const PtSegmentSnapshot& segment) {
+    if (!segment.rack_id.empty()) {
+        return "rack:" + segment.rack_id;
+    }
+    return segment.host_id.empty() ? std::string()
+                                   : "host:" + segment.host_id;
+}
 
 struct PtBuildConfig {
     uint32_t pt_count{128};

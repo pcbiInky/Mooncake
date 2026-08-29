@@ -1214,6 +1214,7 @@ void NoFSegmentManager::GetSegmentSpaceReports(
         report.segment_id = id;
         report.name = mounted.segment.name;
         report.host_id = mounted.segment.host_id;
+        report.rack_id = mounted.segment.rack_id;
         if (mounted.buf_allocator) {
             const size_t capacity = mounted.buf_allocator->capacity();
             if (capacity == kAllocatorUnknownFreeSpace) {

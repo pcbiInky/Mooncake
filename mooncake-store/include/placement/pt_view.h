@@ -23,7 +23,10 @@ struct PtTarget {
     // via epoch/resource change detection.
     std::string name;
     std::string host_id;
-    std::string failure_domain_id;  // == host_id in the first version
+    std::string rack_id;
+    // Effective fault domain for this view: "rack:<rack_id>" when rack_id is
+    // present, otherwise "host:<host_id>" (best-effort fallback).
+    std::string failure_domain_id;
 };
 
 struct PtEntry {

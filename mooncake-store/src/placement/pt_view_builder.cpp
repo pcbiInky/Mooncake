@@ -5,7 +5,6 @@
 #include <cmath>
 #include <numeric>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "random.h"
@@ -26,23 +25,153 @@ struct ClassTopology {
     std::vector<const PtSegmentSnapshot*> segments;
     std::vector<size_t> segment_host;
     std::vector<std::vector<size_t>> host_segments;
+    std::vector<std::string> host_rack_ids;
+    std::vector<std::vector<size_t>> domain_hosts;
+    std::vector<std::string> domain_ids;
 };
 
 struct IncrementPlan {
     std::vector<double> segment_increments;
     std::vector<double> host_increments;
+    std::vector<double> domain_increments;
 };
 
 struct SlotPlan {
     std::vector<uint64_t> segment_slots;
     std::vector<uint64_t> host_slots;
+    std::vector<uint64_t> domain_slots;
 };
+
+std::optional<std::vector<double>> DistributeWithCaps(
+    const std::vector<double>& weights, const std::vector<double>& caps,
+    double total) {
+    if (weights.size() != caps.size() || total < 0.0) {
+        return std::nullopt;
+    }
+    constexpr double kEpsilon = 1e-12;
+    const double total_cap =
+        std::accumulate(caps.begin(), caps.end(), 0.0);
+    if (total_cap + kEpsilon < total) {
+        return std::nullopt;
+    }
+
+    std::vector<double> result(weights.size(), 0.0);
+    std::vector<bool> active(weights.size(), false);
+    for (size_t i = 0; i < weights.size(); ++i) {
+        active[i] = weights[i] > kEpsilon && caps[i] > kEpsilon;
+    }
+
+    double remaining = total;
+    while (remaining > kEpsilon) {
+        double active_weight = 0.0;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            if (active[i]) {
+                active_weight += weights[i];
+            }
+        }
+        if (active_weight <= kEpsilon) {
+            return std::nullopt;
+        }
+
+        bool capped_any = false;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            if (!active[i]) {
+                continue;
+            }
+            const double proposed = remaining * weights[i] / active_weight;
+            if (proposed > caps[i] + kEpsilon) {
+                result[i] = caps[i];
+                remaining -= caps[i];
+                active[i] = false;
+                capped_any = true;
+            }
+        }
+        if (capped_any) {
+            continue;
+        }
+        for (size_t i = 0; i < weights.size(); ++i) {
+            if (active[i]) {
+                result[i] = remaining * weights[i] / active_weight;
+            }
+        }
+        remaining = 0.0;
+    }
+    return result;
+}
+
+std::optional<std::vector<uint64_t>> RoundQuotas(
+    const std::vector<double>& weights, uint64_t total,
+    const std::vector<uint64_t>& caps) {
+    if (weights.size() != caps.size()) {
+        return std::nullopt;
+    }
+    const uint64_t total_cap =
+        std::accumulate(caps.begin(), caps.end(), uint64_t{0});
+    const double weight_sum =
+        std::accumulate(weights.begin(), weights.end(), 0.0);
+    if (total_cap < total || weight_sum <= 0.0) {
+        return std::nullopt;
+    }
+
+    std::vector<uint64_t> quotas(weights.size(), 0);
+    std::vector<std::pair<double, size_t>> remainders;
+    remainders.reserve(weights.size());
+    uint64_t assigned = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const double raw = static_cast<double>(total) * weights[i] /
+                           weight_sum;
+        quotas[i] = std::min<uint64_t>(
+            static_cast<uint64_t>(std::floor(raw)), caps[i]);
+        assigned += quotas[i];
+        remainders.emplace_back(raw - std::floor(raw), i);
+    }
+    std::stable_sort(remainders.begin(), remainders.end(),
+                     [](const auto& lhs, const auto& rhs) {
+                         return lhs.first > rhs.first;
+                     });
+    while (assigned < total) {
+        bool made_progress = false;
+        for (const auto& [remainder, i] : remainders) {
+            (void)remainder;
+            if (quotas[i] >= caps[i]) {
+                continue;
+            }
+            ++quotas[i];
+            ++assigned;
+            made_progress = true;
+            if (assigned == total) {
+                break;
+            }
+        }
+        if (!made_progress) {
+            return std::nullopt;
+        }
+    }
+    return quotas;
+}
 
 std::optional<ClassTopology> BuildClassTopology(
     const std::vector<const PtSegmentSnapshot*>& eligible,
     uint64_t max_inclusive, uint32_t replica_num) {
     ClassTopology topology;
+
+    // A Host belongs to at most one explicit rack. If at least one Segment
+    // reports the rack, reuse it for sibling Segments whose rack_id is empty.
+    // Conflicting explicit rack IDs are a malformed topology.
+    std::unordered_map<std::string, std::string> rack_by_host;
+    for (const auto* segment : eligible) {
+        auto [it, inserted] =
+            rack_by_host.emplace(segment->host_id, segment->rack_id);
+        if (!inserted && !segment->rack_id.empty()) {
+            if (!it->second.empty() && it->second != segment->rack_id) {
+                return std::nullopt;
+            }
+            it->second = segment->rack_id;
+        }
+    }
+
     std::unordered_map<std::string, size_t> host_index;
+    std::unordered_map<std::string, size_t> domain_index;
     for (const auto* segment : eligible) {
         if (segment->largest_free < max_inclusive) {
             continue;
@@ -51,13 +180,26 @@ std::optional<ClassTopology> BuildClassTopology(
             host_index.emplace(segment->host_id, host_index.size());
         if (inserted) {
             topology.host_segments.emplace_back();
+            const std::string& rack_id = rack_by_host.at(segment->host_id);
+            const std::string domain_id =
+                rack_id.empty() ? "host:" + segment->host_id
+                                : "rack:" + rack_id;
+            auto [domain_it, domain_inserted] =
+                domain_index.emplace(domain_id, domain_index.size());
+            if (domain_inserted) {
+                topology.domain_hosts.emplace_back();
+                topology.domain_ids.push_back(domain_id);
+            }
+            topology.host_rack_ids.push_back(rack_id);
+            topology.domain_hosts[domain_it->second].push_back(it->second);
         }
         const size_t segment_index = topology.segments.size();
         topology.segments.push_back(segment);
         topology.segment_host.push_back(it->second);
         topology.host_segments[it->second].push_back(segment_index);
     }
-    if (topology.host_segments.size() < replica_num) {
+    if (topology.host_segments.size() < replica_num ||
+        topology.domain_hosts.size() < replica_num) {
         return std::nullopt;
     }
     return topology;
@@ -81,40 +223,58 @@ std::optional<IncrementPlan> PlanIncrements(
     }
 
     const size_t host_count = topology.host_segments.size();
-    // A host receives at most W/N*k of the planned increment. The 1/R cap
-    // is the structural limit imposed by one failure domain per PT row.
-    const double limit_per_host =
+    const size_t domain_count = topology.domain_hosts.size();
+    // Host balance always uses physical Host count. Independently, both a
+    // Host and an effective failure domain can contribute at most one slot
+    // per PT row.
+    const double host_limit =
         std::min(config.host_increment_skew_k /
                      static_cast<double>(host_count),
                  1.0 / static_cast<double>(config.replica_num));
-    plan.host_increments.resize(host_count, 0.0);
+    std::vector<double> raw_host_increments(host_count, 0.0);
     for (size_t i = 0; i < topology.segments.size(); ++i) {
-        plan.host_increments[topology.segment_host[i]] +=
+        raw_host_increments[topology.segment_host[i]] +=
             plan.segment_increments[i];
     }
 
-    // Clamp W/N*k and redistribute the excess until every host is below
-    // both the skew limit and the one-slot-per-row feasibility limit.
-    for (size_t round = 0; round <= host_count; ++round) {
-        double excess = 0.0;
-        double headroom_total = 0.0;
-        for (double& host_increment : plan.host_increments) {
-            if (host_increment > limit_per_host) {
-                excess += host_increment - limit_per_host;
-                host_increment = limit_per_host;
-            } else {
-                headroom_total += limit_per_host - host_increment;
+    std::vector<double> raw_domain_increments(domain_count, 0.0);
+    std::vector<double> domain_caps(domain_count, 0.0);
+    for (size_t d = 0; d < domain_count; ++d) {
+        double host_headroom = 0.0;
+        for (const size_t h : topology.domain_hosts[d]) {
+            raw_domain_increments[d] += raw_host_increments[h];
+            if (raw_host_increments[h] > 0.0) {
+                host_headroom += host_limit;
             }
         }
-        if (excess <= 1e-12 || headroom_total <= 1e-12) {
-            break;
+        domain_caps[d] =
+            std::min(1.0 / static_cast<double>(config.replica_num),
+                     host_headroom);
+    }
+    auto domains =
+        DistributeWithCaps(raw_domain_increments, domain_caps, 1.0);
+    if (!domains) {
+        return std::nullopt;
+    }
+    plan.domain_increments = std::move(*domains);
+
+    plan.host_increments.assign(host_count, 0.0);
+    for (size_t d = 0; d < domain_count; ++d) {
+        std::vector<double> weights;
+        std::vector<double> caps;
+        weights.reserve(topology.domain_hosts[d].size());
+        caps.reserve(topology.domain_hosts[d].size());
+        for (const size_t h : topology.domain_hosts[d]) {
+            weights.push_back(raw_host_increments[h]);
+            caps.push_back(raw_host_increments[h] > 0.0 ? host_limit : 0.0);
         }
-        for (double& host_increment : plan.host_increments) {
-            if (host_increment < limit_per_host) {
-                const double share =
-                    (limit_per_host - host_increment) / headroom_total;
-                host_increment += excess * share;
-            }
+        auto hosts = DistributeWithCaps(
+            weights, caps, plan.domain_increments[d]);
+        if (!hosts) {
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < topology.domain_hosts[d].size(); ++i) {
+            plan.host_increments[topology.domain_hosts[d][i]] = (*hosts)[i];
         }
     }
     return plan;
@@ -126,55 +286,39 @@ std::optional<SlotPlan> RoundSlots(const ClassTopology& topology,
     const size_t host_count = topology.host_segments.size();
     const uint64_t total_slots =
         static_cast<uint64_t>(config.pt_count) * config.replica_num;
-    const double host_weight_sum = std::accumulate(
-        increments.host_increments.begin(), increments.host_increments.end(),
-        0.0);
-    if (host_weight_sum <= 0.0) {
+    const uint64_t host_slot_cap = std::min<uint64_t>(
+        config.pt_count,
+        static_cast<uint64_t>(std::ceil(
+            static_cast<double>(total_slots) *
+            config.host_increment_skew_k /
+            static_cast<double>(topology.host_segments.size()))));
+
+    SlotPlan plan;
+    std::vector<uint64_t> domain_caps(topology.domain_hosts.size(),
+                                      config.pt_count);
+    auto domain_slots =
+        RoundQuotas(increments.domain_increments, total_slots, domain_caps);
+    if (!domain_slots) {
         return std::nullopt;
     }
+    plan.domain_slots = std::move(*domain_slots);
 
-    // Round host quotas first so Segment-level remainders cannot push their
-    // owning Host beyond the k/N or one-slot-per-row cap.
-    const uint64_t skew_slot_cap = static_cast<uint64_t>(std::ceil(
-        static_cast<double>(total_slots) * config.host_increment_skew_k /
-        static_cast<double>(host_count)));
-    const uint64_t host_slot_cap =
-        std::min<uint64_t>(config.pt_count, skew_slot_cap);
-    SlotPlan plan;
-    plan.host_slots.resize(host_count, 0);
-    uint64_t assigned_host_slots = 0;
-    std::vector<std::pair<double, size_t>> host_remainders;
-    host_remainders.reserve(host_count);
-    for (size_t h = 0; h < host_count; ++h) {
-        const double raw = static_cast<double>(total_slots) *
-                           increments.host_increments[h] / host_weight_sum;
-        plan.host_slots[h] =
-            std::min<uint64_t>(static_cast<uint64_t>(std::floor(raw)),
-                               host_slot_cap);
-        assigned_host_slots += plan.host_slots[h];
-        host_remainders.emplace_back(
-            raw - static_cast<double>(std::floor(raw)), h);
-    }
-    std::stable_sort(host_remainders.begin(), host_remainders.end(),
-                     [](const auto& a, const auto& b) {
-                         return a.first > b.first;
-                     });
-    while (assigned_host_slots < total_slots) {
-        bool made_progress = false;
-        for (const auto& [remainder, h] : host_remainders) {
-            (void)remainder;
-            if (plan.host_slots[h] >= host_slot_cap) {
-                continue;
-            }
-            ++plan.host_slots[h];
-            ++assigned_host_slots;
-            made_progress = true;
-            if (assigned_host_slots == total_slots) {
-                break;
-            }
+    plan.host_slots.assign(host_count, 0);
+    for (size_t d = 0; d < topology.domain_hosts.size(); ++d) {
+        std::vector<double> weights;
+        std::vector<uint64_t> caps;
+        weights.reserve(topology.domain_hosts[d].size());
+        caps.reserve(topology.domain_hosts[d].size());
+        for (const size_t h : topology.domain_hosts[d]) {
+            weights.push_back(increments.host_increments[h]);
+            caps.push_back(host_slot_cap);
         }
-        if (!made_progress) {
+        auto slots = RoundQuotas(weights, plan.domain_slots[d], caps);
+        if (!slots) {
             return std::nullopt;
+        }
+        for (size_t i = 0; i < topology.domain_hosts[d].size(); ++i) {
+            plan.host_slots[topology.domain_hosts[d][i]] = (*slots)[i];
         }
     }
 
@@ -214,53 +358,34 @@ std::optional<SlotPlan> RoundSlots(const ClassTopology& topology,
     return plan;
 }
 
-std::optional<std::vector<size_t>> PickHostsForRow(
-    const std::vector<std::vector<size_t>>& host_queues, size_t rows_left,
+std::optional<std::vector<size_t>> PickGroupsForRow(
+    const std::vector<size_t>& remaining_slots, size_t rows_left,
     uint32_t replica_num) {
-    std::vector<size_t> picked_hosts;
-    picked_hosts.reserve(replica_num);
-    const auto already_picked = [&picked_hosts](size_t h) {
-        return std::find(picked_hosts.begin(), picked_hosts.end(), h) !=
-               picked_hosts.end();
-    };
-
-    // A Host with one slot for every remaining row is mandatory. Selecting
-    // all mandatory Hosts preserves remaining_slots[h] <= rows_left - 1.
-    for (size_t h = 0; h < host_queues.size(); ++h) {
-        if (host_queues[h].size() < rows_left) {
+    std::vector<size_t> candidates;
+    candidates.reserve(remaining_slots.size());
+    for (size_t group = 0; group < remaining_slots.size(); ++group) {
+        if (remaining_slots[group] == 0) {
             continue;
         }
-        if (picked_hosts.size() >= replica_num) {
+        if (remaining_slots[group] > rows_left) {
             return std::nullopt;
         }
-        picked_hosts.push_back(h);
+        candidates.push_back(group);
     }
-    while (picked_hosts.size() < replica_num) {
-        size_t total = 0;
-        for (size_t h = 0; h < host_queues.size(); ++h) {
-            if (!host_queues[h].empty() && !already_picked(h)) {
-                total += host_queues[h].size();
-            }
-        }
-        if (total == 0) {
-            return std::nullopt;
-        }
-        size_t draw = randomIndex(total);
-        size_t selected = SIZE_MAX;
-        for (size_t h = 0; h < host_queues.size(); ++h) {
-            if (host_queues[h].empty() || already_picked(h)) {
-                continue;
-            }
-            if (draw < host_queues[h].size()) {
-                selected = h;
-                break;
-            }
-            draw -= host_queues[h].size();
-        }
-        picked_hosts.push_back(selected);
+    if (candidates.size() < replica_num) {
+        return std::nullopt;
     }
-    randomShuffle(picked_hosts.begin(), picked_hosts.end());
-    return picked_hosts;
+
+    // Havel-Hakimi style construction: consume the groups with the largest
+    // remaining quotas first. This deterministically preserves feasibility
+    // for the following rows and never selects one group twice in a row.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&remaining_slots](size_t lhs, size_t rhs) {
+                         return remaining_slots[lhs] > remaining_slots[rhs];
+                     });
+    std::vector<size_t> picked_groups(candidates.begin(),
+                                      candidates.begin() + replica_num);
+    return picked_groups;
 }
 
 std::optional<std::vector<PtEntry>> BuildRows(
@@ -289,30 +414,63 @@ std::optional<std::vector<PtEntry>> BuildRows(
         }
     }
 
+    std::vector<size_t> domain_remaining(slots.domain_slots.begin(),
+                                         slots.domain_slots.end());
+    for (size_t d = 0; d < topology.domain_hosts.size(); ++d) {
+        size_t host_slots = 0;
+        for (const size_t h : topology.domain_hosts[d]) {
+            host_slots += host_queues[h].size();
+        }
+        if (host_slots != domain_remaining[d] ||
+            domain_remaining[d] > config.pt_count) {
+            return std::nullopt;
+        }
+    }
+
     std::vector<PtEntry> entries;
     entries.reserve(config.pt_count);
     for (uint32_t pt_id = 0; pt_id < config.pt_count; ++pt_id) {
         const size_t rows_left = static_cast<size_t>(config.pt_count) - pt_id;
-        auto picked_hosts =
-            PickHostsForRow(host_queues, rows_left, config.replica_num);
-        if (!picked_hosts) {
+        auto picked_domains = PickGroupsForRow(
+            domain_remaining, rows_left, config.replica_num);
+        if (!picked_domains) {
             return std::nullopt;
         }
         PtEntry entry;
         entry.pt_id = pt_id;
         entry.replicas.reserve(config.replica_num);
-        for (const size_t h : *picked_hosts) {
-            const size_t segment_index = host_queues[h].back();
-            host_queues[h].pop_back();
+        for (const size_t d : *picked_domains) {
+            size_t selected_host = SIZE_MAX;
+            for (const size_t candidate : topology.domain_hosts[d]) {
+                if (host_queues[candidate].empty()) {
+                    continue;
+                }
+                if (selected_host == SIZE_MAX ||
+                    host_queues[candidate].size() >
+                        host_queues[selected_host].size()) {
+                    selected_host = candidate;
+                }
+            }
+            if (selected_host == SIZE_MAX) {
+                return std::nullopt;
+            }
+            const size_t segment_index = host_queues[selected_host].back();
+            host_queues[selected_host].pop_back();
+            --domain_remaining[d];
             const PtSegmentSnapshot* segment = topology.segments[segment_index];
             entry.replicas.push_back(PtTarget{
                 segment->segment_id, segment->name, segment->host_id,
-                segment->host_id});
+                topology.host_rack_ids[selected_host],
+                topology.domain_ids[d]});
         }
         entries.push_back(std::move(entry));
     }
     if (std::any_of(host_queues.begin(), host_queues.end(),
                     [](const auto& queue) { return !queue.empty(); })) {
+        return std::nullopt;
+    }
+    if (std::any_of(domain_remaining.begin(), domain_remaining.end(),
+                    [](size_t remaining) { return remaining != 0; })) {
         return std::nullopt;
     }
     return entries;
@@ -344,8 +502,8 @@ std::optional<PtView> PtViewBuilder::Build(
         return std::nullopt;
     }
 
-    // 1. Filter: only segments with explicit host_id participate (RFC 0005
-    // §7.1: TOPOLOGY_INCOMPLETE segments are excluded, never guessed).
+    // 1. A stable Host identity is required for k/N balance and same-Host
+    // exclusion. rack_id is optional and falls back to Host best-effort.
     // Segments without bin-precise capacity reports are excluded as well.
     std::vector<const PtSegmentSnapshot*> eligible;
     for (const auto& segment : segments) {
@@ -365,17 +523,6 @@ std::optional<PtView> PtViewBuilder::Build(
     }
     if (stats) {
         stats->eligible_segments = eligible.size();
-    }
-
-    // Need at least replica_num distinct failure domains overall.
-    {
-        std::unordered_set<std::string> domains;
-        for (const auto* segment : eligible) {
-            domains.insert(segment->host_id);
-        }
-        if (domains.size() < config.replica_num) {
-            return std::nullopt;
-        }
     }
 
     // 2. The first version uses fixed size classes. Keeping the policy set

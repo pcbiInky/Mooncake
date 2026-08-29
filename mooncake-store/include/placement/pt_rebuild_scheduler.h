@@ -62,6 +62,7 @@ class PtRebuildScheduler final {
             snapshot.segment_id = report.segment_id;
             snapshot.name = report.name;
             snapshot.host_id = report.host_id;
+            snapshot.rack_id = report.rack_id;
             snapshot.unknown_capacity = report.unknown_capacity;
             snapshot.capacity = report.capacity;
             snapshot.used = report.used;

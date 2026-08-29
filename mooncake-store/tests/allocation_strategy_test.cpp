@@ -1011,12 +1011,12 @@ TEST(NofPtReplicaAllocatorTest, RetriesADistinctRowAfterAllocationFailure) {
         randomUniform<size_t>(0, policy.entries.size() - 1, probe);
     const size_t good_row = 1 - first_row;
     policy.entries[first_row].replicas = {
-        PtTarget{PtRegionId(1), "bad1", "host-a", "host-a"},
-        PtTarget{PtRegionId(2), "bad2", "host-b", "host-b"},
+        PtTarget{PtRegionId(1), "bad1", "host-a", "", "host:host-a"},
+        PtTarget{PtRegionId(2), "bad2", "host-b", "", "host:host-b"},
     };
     policy.entries[good_row].replicas = {
-        PtTarget{PtRegionId(3), "good1", "host-c", "host-c"},
-        PtTarget{PtRegionId(4), "good2", "host-d", "host-d"},
+        PtTarget{PtRegionId(3), "good1", "host-c", "", "host:host-c"},
+        PtTarget{PtRegionId(4), "good2", "host-d", "", "host:host-d"},
     };
     view->policies.push_back(std::move(policy));
     view_manager.Publish(std::move(view));
@@ -1048,8 +1048,10 @@ TEST(NofPtReplicaAllocatorTest, RollsBackPartialMultiReplicaRow) {
     policy.entries.push_back(PtEntry{
         0,
         {
-            PtTarget{PtRegionId(1), "first", "host-a", "host-a"},
-            PtTarget{PtRegionId(2), "failed", "host-b", "host-b"},
+            PtTarget{PtRegionId(1), "first", "host-a", "",
+                     "host:host-a"},
+            PtTarget{PtRegionId(2), "failed", "host-b", "",
+                     "host:host-b"},
         },
     });
     view->policies.push_back(std::move(policy));

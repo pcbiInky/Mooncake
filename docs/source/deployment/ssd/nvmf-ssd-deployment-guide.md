@@ -154,8 +154,8 @@ The transport options are passed to the SPDK `nvmf_create_transport` RPC. If an 
 ```bash
 python3 -m mooncake.mooncake_ssd_register \
     --master_server_address=192.168.65.81:50051 \
-    --spdk_target_info="ip:192.168.65.56 path:/home/spdk" \
-    --spdk_target_info="ip:192.168.65.57 path:/root/spdk"
+    --spdk_target_info="ip:192.168.65.56 path:/home/spdk host_id:host1 rack_id:rack1" \
+    --spdk_target_info="ip:192.168.65.57 path:/root/spdk host_id:host2 rack_id:rack2"
 ```
 
 #### Parameters
@@ -163,7 +163,7 @@ python3 -m mooncake.mooncake_ssd_register \
 | Parameter | Description |
 |-----------|-------------|
 | `--master_server_address` | IP address and port of the master service node. The default port is 50051. |
-| `--spdk_target_info` | Target node information, including `ip`, the node IP address, and `path`, the SPDK installation path. |
+| `--spdk_target_info` | Target node information, including `ip`, the node IP address, `path`, the SPDK installation path, optional `host_id`, the stable physical host identity (falls back to the resolved transport IP), and optional `rack_id`, the rack/power-domain identity (falls back to `host_id` for best-effort placement). |
 | `--username` | SSH username used to connect to target nodes. The default value is `root`. |
 | `--port` | SSH port used to connect to target nodes. The default value is `22`. |
 | `--password` | SSH password used to connect to target nodes. |

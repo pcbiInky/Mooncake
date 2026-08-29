@@ -363,6 +363,8 @@ class MasterService {
         std::string segment_id;
         std::string name;
         std::string host_id;
+        std::string rack_id;
+        std::string failure_domain_id;
     };
 
     struct PtEntryDetail {

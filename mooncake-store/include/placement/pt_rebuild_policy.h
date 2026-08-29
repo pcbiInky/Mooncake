@@ -53,8 +53,8 @@ inline PtBalanceSummary ComputePtBalanceSummary(
     std::vector<const PtSegmentSnapshot*> eligible;
     eligible.reserve(segments.size());
     for (const auto& segment : segments) {
-        if (segment.host_id.empty() || segment.unknown_capacity ||
-            segment.capacity == 0) {
+        if (EffectiveFailureDomain(segment).empty() ||
+            segment.unknown_capacity || segment.capacity == 0) {
             continue;
         }
         eligible.push_back(&segment);
@@ -67,7 +67,10 @@ inline PtBalanceSummary ComputePtBalanceSummary(
         if (lhs->name != rhs->name) {
             return lhs->name < rhs->name;
         }
-        return lhs->host_id < rhs->host_id;
+        if (lhs->host_id != rhs->host_id) {
+            return lhs->host_id < rhs->host_id;
+        }
+        return EffectiveFailureDomain(*lhs) < EffectiveFailureDomain(*rhs);
     });
 
     constexpr uint64_t kFnvOffset = 1469598103934665603ULL;
@@ -90,6 +93,8 @@ inline PtBalanceSummary ComputePtBalanceSummary(
         HashValue(&summary.topology_fingerprint, segment->segment_id.second);
         HashString(&summary.topology_fingerprint, segment->name);
         HashString(&summary.topology_fingerprint, segment->host_id);
+        HashString(&summary.topology_fingerprint,
+                   EffectiveFailureDomain(*segment));
         HashValue(&summary.topology_fingerprint, segment->capacity);
 
         HashValue(&summary.space_fingerprint, segment->segment_id.first);

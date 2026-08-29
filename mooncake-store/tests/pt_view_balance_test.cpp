@@ -5,11 +5,13 @@
 //     tracks free-space water filling with the W/N*k host clamp.
 //  2. One dominant host would exceed the W/N*k clamp -> its share is
 //     capped near the clamp and the excess is redistributed.
-//  3. Domain exclusivity: no PT row ever repeats a failure domain.
+//  3. Failure-domain exclusivity: no PT row ever repeats a Host or Rack.
 //  4. Allocation simulation over many rows: per-segment placement
 //     frequency tracks each segment's slot count within tolerance.
 //  5. R=3 row feasibility after hierarchical Host/Segment rounding.
 //  6. Invalid direct builder configuration is rejected.
+//  7. Rack-aware placement, missing-Rack Host fallback, and multi-NIC Hosts.
+//  8. Rack topology and size-class combinations with no feasible PT view.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -32,12 +34,14 @@ constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 
 PtSegmentSnapshot MakeSegment(const std::string& name,
                                const std::string& host, uint64_t capacity_gib,
-                               uint64_t used_gib) {
+                               uint64_t used_gib,
+                               const std::string& rack = "") {
     PtSegmentSnapshot snapshot;
     snapshot.segment_id.first = std::hash<std::string>{}(name);
     snapshot.segment_id.second = 1;
     snapshot.name = name;
     snapshot.host_id = host;
+    snapshot.rack_id = rack;
     snapshot.capacity = capacity_gib * kMiB;
     snapshot.used = used_gib * kMiB;
     snapshot.largest_free =
@@ -319,6 +323,156 @@ int main() {
         invalid.replica_num = 0;
         Check(!PtViewBuilder::Build(segments, invalid).has_value(),
               "scenario6: zero replicas rejected");
+    }
+
+    // ---- Scenario 7: Rack exclusivity and Host balancing are independent.
+    // Every row must select one Host from each Rack, while Hosts inside a Rack
+    // still split that Rack's slots according to free space.
+    {
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("a1", "hostA1", 16, 0, "rackA"),
+            MakeSegment("a2", "hostA2", 16, 8, "rackA"),
+            MakeSegment("b1", "hostB1", 16, 4, "rackB"),
+            MakeSegment("b2", "hostB2", 16, 12, "rackB"),
+        };
+        auto view = PtViewBuilder::Build(segments, config);
+        Check(view.has_value(), "scenario7: two-rack view builds");
+        if (!view) return failures ? 1 : 0;
+        const PtPolicyView* policy = view->FindPolicy(2 * kMiB);
+        Check(policy != nullptr, "scenario7: small class policy exists");
+        if (policy) {
+            bool rows_ok = true;
+            for (const auto& entry : policy->entries) {
+                std::unordered_set<std::string> hosts;
+                std::unordered_set<std::string> domains;
+                for (const auto& target : entry.replicas) {
+                    hosts.insert(target.host_id);
+                    domains.insert(target.failure_domain_id);
+                }
+                if (hosts.size() != config.replica_num ||
+                    domains.size() != config.replica_num) {
+                    rows_ok = false;
+                }
+            }
+            Check(rows_ok,
+                  "scenario7: every row has distinct Hosts and Racks");
+        }
+    }
+
+    // ---- Scenario 8: missing rack_id uses Host as a best-effort domain.
+    {
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("a1", "hostA", 16, 0, "rackA"),
+            MakeSegment("a2", "hostB", 16, 0, "rackA"),
+            MakeSegment("fallback", "hostC", 16, 0),
+        };
+        auto view = PtViewBuilder::Build(segments, config);
+        Check(view.has_value(), "scenario8: Host fallback view builds");
+        if (!view) return failures ? 1 : 0;
+        const PtPolicyView* policy = view->FindPolicy(2 * kMiB);
+        Check(policy != nullptr, "scenario8: small class policy exists");
+        if (policy) {
+            bool saw_rack = false;
+            bool saw_host_fallback = false;
+            for (const auto& entry : policy->entries) {
+                for (const auto& target : entry.replicas) {
+                    saw_rack |= target.failure_domain_id == "rack:rackA";
+                    saw_host_fallback |=
+                        target.failure_domain_id == "host:hostC";
+                }
+            }
+            Check(saw_rack && saw_host_fallback,
+                  "scenario8: DFX distinguishes Rack and Host fallback");
+        }
+    }
+
+    // ---- Scenario 9: two NICs on one Host share one Host identity and can
+    // never occupy two replica positions in the same row.
+    {
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("nic0", "hostA", 16, 0, "rackA"),
+            MakeSegment("nic1", "hostA", 16, 0),
+            MakeSegment("peer", "hostB", 16, 0, "rackB"),
+        };
+        auto view = PtViewBuilder::Build(segments, config);
+        Check(view.has_value(), "scenario9: multi-NIC Host view builds");
+        if (!view) return failures ? 1 : 0;
+        const PtPolicyView* policy = view->FindPolicy(2 * kMiB);
+        Check(policy != nullptr, "scenario9: small class policy exists");
+        if (policy) {
+            bool hosts_ok = true;
+            bool missing_rack_inherited = false;
+            for (const auto& entry : policy->entries) {
+                std::unordered_set<std::string> hosts;
+                for (const auto& target : entry.replicas) {
+                    hosts.insert(target.host_id);
+                    if (target.name == "nic1") {
+                        missing_rack_inherited |=
+                            target.rack_id == "rackA" &&
+                            target.failure_domain_id == "rack:rackA";
+                    }
+                }
+                hosts_ok &= hosts.size() == entry.replicas.size();
+            }
+            Check(hosts_ok, "scenario9: no row repeats a physical Host");
+            Check(missing_rack_inherited,
+                  "scenario9: sibling Segment inherits known Host Rack");
+        }
+    }
+
+    // ---- Scenario 10: Rack constraints that have no feasible slot plan.
+    {
+        // Replica count 2 but only one effective Rack.
+        std::vector<PtSegmentSnapshot> one_rack = {
+            MakeSegment("a", "hostA", 16, 0, "rackA"),
+            MakeSegment("b", "hostB", 16, 0, "rackA"),
+        };
+        Check(!PtViewBuilder::Build(one_rack, config).has_value(),
+              "scenario10: one Rack cannot serve R=2");
+
+        // Rack B has only one of four Hosts. With k=1.5, that Host is capped
+        // below the 50% Rack share required by R=2, so the joint Host/Rack
+        // constraints are mathematically infeasible.
+        std::vector<PtSegmentSnapshot> host_cap_conflict = {
+            MakeSegment("a1", "hostA1", 16, 0, "rackA"),
+            MakeSegment("a2", "hostA2", 16, 0, "rackA"),
+            MakeSegment("a3", "hostA3", 16, 0, "rackA"),
+            MakeSegment("b1", "hostB1", 16, 0, "rackB"),
+        };
+        Check(!PtViewBuilder::Build(host_cap_conflict, config).has_value(),
+              "scenario10: Rack share conflicts with Host k/N cap");
+
+        // One physical Host cannot claim two explicit Racks.
+        std::vector<PtSegmentSnapshot> conflicting_rack = {
+            MakeSegment("nic0", "hostA", 16, 0, "rackA"),
+            MakeSegment("nic1", "hostA", 16, 0, "rackB"),
+            MakeSegment("peer", "hostB", 16, 0, "rackC"),
+        };
+        Check(!PtViewBuilder::Build(conflicting_rack, config).has_value(),
+              "scenario10: conflicting Rack IDs on one Host rejected");
+
+        // Three replicas need three effective failure domains even when the
+        // number of physical Hosts is sufficient.
+        PtBuildConfig r3_config = config;
+        r3_config.replica_num = 3;
+        std::vector<PtSegmentSnapshot> only_two_racks = {
+            MakeSegment("a1", "hostA1", 16, 0, "rackA"),
+            MakeSegment("a2", "hostA2", 16, 0, "rackA"),
+            MakeSegment("b1", "hostB1", 16, 0, "rackB"),
+        };
+        Check(!PtViewBuilder::Build(only_two_racks, r3_config).has_value(),
+              "scenario10: two Racks cannot serve R=3");
+
+        // A Rack that exists in topology but cannot serve even the smallest
+        // size class is not eligible for any policy. No complete row can be
+        // formed, so the builder must keep the old view.
+        std::vector<PtSegmentSnapshot> rack_without_contiguous_space = {
+            MakeSegment("a", "hostA", 16, 0, "rackA"),
+            MakeSegment("b", "hostB", 16, 15, "rackB"),
+        };
+        Check(!PtViewBuilder::Build(rack_without_contiguous_space, config)
+                   .has_value(),
+              "scenario10: Rack below smallest size class rejected");
     }
 
     if (failures == 0) {
