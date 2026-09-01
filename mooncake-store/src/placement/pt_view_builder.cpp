@@ -10,8 +10,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include "random.h"
-
 namespace mooncake {
 
 namespace {
@@ -32,12 +30,6 @@ struct ClassTopology {
     std::vector<std::string> host_rack_ids;
     std::vector<std::vector<size_t>> domain_hosts;
     std::vector<std::string> domain_ids;
-};
-
-struct IncrementPlan {
-    std::vector<double> segment_increments;
-    std::vector<double> host_increments;
-    std::vector<double> domain_increments;
 };
 
 struct SlotPlan {
@@ -72,6 +64,13 @@ inline uint64_t deterministicRandomHash(uint64_t seed, uint64_t key) {
     return deterministicRandomMix(seed ^ deterministicRandomMix(key));
 }
 
+// Salt for pre-hashing string keys (domain IDs, host IDs) into stable
+// uint64 keys. Fixed (not seed-derived) so the key identity is stable
+// across rebuilds; the per-row randomness comes from row_seed inside
+// deterministicWeightedScore. Segment keys hash their UUID pair with
+// the same one-pass pattern via deterministicRandomHash.
+constexpr uint64_t kStableKeySalt = 0;
+
 inline uint64_t deterministicRandomHashString(uint64_t seed,
                                               std::string_view key) {
     uint64_t hash = deterministicRandomMix(seed);
@@ -79,6 +78,10 @@ inline uint64_t deterministicRandomHashString(uint64_t seed,
         hash = deterministicRandomMix(hash ^ byte);
     }
     return hash;
+}
+
+inline uint64_t StableKey(const std::string& value) {
+    return deterministicRandomHashString(kStableKeySalt, value);
 }
 
 // Efraimidis-Spirakis / straw2-style score. Pick the candidate with the
@@ -96,88 +99,121 @@ inline double deterministicWeightedScore(uint64_t seed, uint64_t stream,
     return std::log(uniform) / weight;
 }
 
-std::optional<std::vector<double>> DistributeWithCaps(
-    const std::vector<double>& weights, const std::vector<double>& caps,
-    double total) {
-    if (weights.size() != caps.size() || total < 0.0) {
-        return std::nullopt;
-    }
-    constexpr double kEpsilon = 1e-12;
-    const double total_cap =
-        std::accumulate(caps.begin(), caps.end(), 0.0);
-    if (total_cap + kEpsilon < total) {
-        return std::nullopt;
-    }
+// ---------------------------------------------------------------------
+// Unified bounded apportionment primitive.
+//
+// Distributes `total` whole slots across candidates proportionally to
+// positive weights, subject to per-candidate integer caps. One call
+// replaces the previous three-stage pipeline (float water-filling ->
+// weighted rounding -> manual largest-remainder top-up).
+//
+// Contract (self-contained, no reliance on upstream filtering):
+//   1. Effective cap: a candidate with zero (or non-finite) weight gets
+//      an effective cap of 0 and never receives a slot. Cap and weight
+//      are independent inputs (cap is structural: N/k/P; weight is
+//      capacity state: free bytes), so this rule must live here rather
+//      than being assumed from the caller.
+//   2. Feasibility: the single up-front check is Sum(effective caps) >=
+//      total. With that check passed, the construction below always
+//      terminates with exact quota conservation (sum(quotas) == total
+//      and quota_i <= cap'_i for every i).
+//
+// Construction: lambda water-filling (x_i = min(cap'_i, lambda * w_i),
+// binary-searched until Sum(x) == total), then floor + a single
+// largest-remainder pass over positive-weight candidates, skipping
+// candidates already at their effective cap. The remainder pass keeps
+// at least one unit of slack per candidate by construction, so it can
+// always absorb the floor residue and the loop finishes without
+// rescanning.
+// ---------------------------------------------------------------------
 
-    std::vector<double> result(weights.size(), 0.0);
-    std::vector<bool> active(weights.size(), false);
-    for (size_t i = 0; i < weights.size(); ++i) {
-        active[i] = weights[i] > kEpsilon && caps[i] > kEpsilon;
-    }
-
-    double remaining = total;
-    while (remaining > kEpsilon) {
-        double active_weight = 0.0;
-        for (size_t i = 0; i < weights.size(); ++i) {
-            if (active[i]) {
-                active_weight += weights[i];
-            }
-        }
-        if (active_weight <= kEpsilon) {
-            return std::nullopt;
-        }
-
-        bool capped_any = false;
-        for (size_t i = 0; i < weights.size(); ++i) {
-            if (!active[i]) {
-                continue;
-            }
-            const double proposed = remaining * weights[i] / active_weight;
-            if (proposed > caps[i] + kEpsilon) {
-                result[i] = caps[i];
-                remaining -= caps[i];
-                active[i] = false;
-                capped_any = true;
-            }
-        }
-        if (capped_any) {
-            continue;
-        }
-        for (size_t i = 0; i < weights.size(); ++i) {
-            if (active[i]) {
-                result[i] = remaining * weights[i] / active_weight;
-            }
-        }
-        remaining = 0.0;
-    }
-    return result;
-}
-
-std::optional<std::vector<uint64_t>> RoundQuotas(
-    const std::vector<double>& weights, uint64_t total,
-    const std::vector<uint64_t>& caps) {
+std::optional<std::vector<uint64_t>> Apportion(
+    const std::vector<double>& weights, const std::vector<uint64_t>& caps,
+    uint64_t total) {
     if (weights.size() != caps.size()) {
         return std::nullopt;
     }
-    const uint64_t total_cap =
-        std::accumulate(caps.begin(), caps.end(), uint64_t{0});
-    const double weight_sum =
-        std::accumulate(weights.begin(), weights.end(), 0.0);
-    if (total_cap < total || weight_sum <= 0.0) {
+    const size_t count = weights.size();
+
+    // Effective caps: cap'_i = (w_i > 0) ? cap_i : 0.
+    std::vector<uint64_t> effective_caps(count, 0);
+    std::vector<double> positive_weights(count, 0.0);
+    uint64_t total_effective_cap = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (weights[i] > 0.0 && std::isfinite(weights[i])) {
+            positive_weights[i] = weights[i];
+            effective_caps[i] = caps[i];
+            total_effective_cap += caps[i];
+        }
+    }
+    if (total_effective_cap < total) {
         return std::nullopt;
     }
 
-    std::vector<uint64_t> quotas(weights.size(), 0);
+    std::vector<uint64_t> quotas(count, 0);
+    if (total == 0) {
+        return quotas;
+    }
+    if (total_effective_cap == total) {
+        // Only one feasible answer: every effective cap is saturated.
+        for (size_t i = 0; i < count; ++i) {
+            quotas[i] = effective_caps[i];
+        }
+        return quotas;
+    }
+
+    // Lambda water-filling: find the smallest lambda with Sum(min(cap',
+    // lambda*w)) == total. The bracket starts wide enough for any
+    // positive weight scale (exponential growth bounds lambda_high in
+    // O(log(total / (w_min * eps))) steps): fixing lambda_high = total
+    // alone would under-bracket when weights are much smaller than
+    // total (e.g. normalized weights), silently degrading the
+    // distribution to index-order splitting.
+    auto capped_sum = [&](double lambda) {
+        double sum = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            if (effective_caps[i] > 0) {
+                sum += std::min(static_cast<double>(effective_caps[i]),
+                                lambda * positive_weights[i]);
+            }
+        }
+        return sum;
+    };
+    double lambda_low = 0.0;
+    double lambda_high = 1.0;
+    while (capped_sum(lambda_high) < static_cast<double>(total)) {
+        lambda_low = lambda_high;
+        lambda_high *= 2.0;
+    }
+    while (lambda_high > lambda_low * (1.0 + 1e-9) + 1e-9) {
+        const double lambda_mid = 0.5 * (lambda_low + lambda_high);
+        if (capped_sum(lambda_mid) < static_cast<double>(total)) {
+            lambda_low = lambda_mid;
+        } else {
+            lambda_high = lambda_mid;
+        }
+    }
+    const double lambda = lambda_high;
+
+    // Floor + largest remainder. `assigned` tracks the committed sum; the
+    // invariant Sum(floor(x_i)) <= total <= Sum(effective_caps) leaves
+    // residue <= count, so one pass (with cap guard) suffices. A second
+    // pass is kept as a terminating safety net for adversarial float
+    // inputs; with contract-abiding inputs it never runs.
     std::vector<std::pair<double, size_t>> remainders;
-    remainders.reserve(weights.size());
+    remainders.reserve(count);
     uint64_t assigned = 0;
-    for (size_t i = 0; i < weights.size(); ++i) {
-        const double raw = static_cast<double>(total) * weights[i] /
-                           weight_sum;
+    for (size_t i = 0; i < count; ++i) {
+        const double raw =
+            std::min(static_cast<double>(effective_caps[i]),
+                     lambda * positive_weights[i]);
+        const double floored = std::floor(std::max(0.0, raw));
         quotas[i] = std::min<uint64_t>(
-            static_cast<uint64_t>(std::floor(raw)), caps[i]);
+            static_cast<uint64_t>(floored), effective_caps[i]);
         assigned += quotas[i];
-        remainders.emplace_back(raw - std::floor(raw), i);
+        if (effective_caps[i] > quotas[i]) {
+            remainders.emplace_back(raw - floored, i);
+        }
     }
     std::stable_sort(remainders.begin(), remainders.end(),
                      [](const auto& lhs, const auto& rhs) {
@@ -187,7 +223,7 @@ std::optional<std::vector<uint64_t>> RoundQuotas(
         bool made_progress = false;
         for (const auto& [remainder, i] : remainders) {
             (void)remainder;
-            if (quotas[i] >= caps[i]) {
+            if (quotas[i] >= effective_caps[i]) {
                 continue;
             }
             ++quotas[i];
@@ -198,7 +234,7 @@ std::optional<std::vector<uint64_t>> RoundQuotas(
             }
         }
         if (!made_progress) {
-            return std::nullopt;
+            return std::nullopt;  // Unreachable with valid inputs.
         }
     }
     return quotas;
@@ -277,115 +313,88 @@ std::optional<ClassTopology> BuildClassTopology(
     return topology;
 }
 
-std::optional<IncrementPlan> PlanIncrements(
-    const ClassTopology& topology, const PtBuildConfig& config) {
-    IncrementPlan plan;
-    plan.segment_increments.resize(topology.segments.size(), 0.0);
-    double total_free = 0.0;
-    for (size_t i = 0; i < topology.segments.size(); ++i) {
-        plan.segment_increments[i] =
-            static_cast<double>(FreeBytes(*topology.segments[i]));
-        total_free += plan.segment_increments[i];
-    }
-    if (total_free <= 0.0) {
-        return std::nullopt;
-    }
-    for (auto& increment : plan.segment_increments) {
-        increment /= total_free;
-    }
+// ---------------------------------------------------------------------
+// Slot plan via three nested Apportion calls.
+//
+// Quota semantics (identical to the previous two-stage pipeline):
+//   * Host hard cap: min(P, ceil(P*R*k/N)) -- the W/N*k skew clamp.
+//   * Domain cap: min(P, sum of *positive-weight* Host hard caps in the
+//     domain). Zero-free hosts contribute no headroom, mirroring the
+//     float-stage behavior; a Rack whose Hosts are all full cannot
+//     receive slots.
+//   * Weights are raw free bytes (aggregated bottom-up: Host weight =
+//     sum of member Segment free bytes, Domain weight = sum of member
+//     Host free bytes).
+// ---------------------------------------------------------------------
 
+std::optional<SlotPlan> ComputeSlotPlan(const ClassTopology& topology,
+                                        const PtBuildConfig& config) {
     const size_t host_count = topology.host_segments.size();
     const size_t domain_count = topology.domain_hosts.size();
-    // Host balance always uses physical Host count. Independently, both a
-    // Host and an effective failure domain can contribute at most one slot
-    // per PT row.
-    const double host_limit =
-        std::min(config.host_increment_skew_k /
-                     static_cast<double>(host_count),
-                 1.0 / static_cast<double>(config.replica_num));
-    std::vector<double> raw_host_increments(host_count, 0.0);
-    for (size_t i = 0; i < topology.segments.size(); ++i) {
-        raw_host_increments[topology.segment_host[i]] +=
-            plan.segment_increments[i];
-    }
-
-    std::vector<double> raw_domain_increments(domain_count, 0.0);
-    std::vector<double> domain_caps(domain_count, 0.0);
-    for (size_t d = 0; d < domain_count; ++d) {
-        double host_headroom = 0.0;
-        for (const size_t h : topology.domain_hosts[d]) {
-            raw_domain_increments[d] += raw_host_increments[h];
-            if (raw_host_increments[h] > 0.0) {
-                host_headroom += host_limit;
-            }
-        }
-        domain_caps[d] =
-            std::min(1.0 / static_cast<double>(config.replica_num),
-                     host_headroom);
-    }
-    auto domains =
-        DistributeWithCaps(raw_domain_increments, domain_caps, 1.0);
-    if (!domains) {
-        return std::nullopt;
-    }
-    plan.domain_increments = std::move(*domains);
-
-    plan.host_increments.assign(host_count, 0.0);
-    for (size_t d = 0; d < domain_count; ++d) {
-        std::vector<double> weights;
-        std::vector<double> caps;
-        weights.reserve(topology.domain_hosts[d].size());
-        caps.reserve(topology.domain_hosts[d].size());
-        for (const size_t h : topology.domain_hosts[d]) {
-            weights.push_back(raw_host_increments[h]);
-            caps.push_back(raw_host_increments[h] > 0.0 ? host_limit : 0.0);
-        }
-        auto hosts = DistributeWithCaps(
-            weights, caps, plan.domain_increments[d]);
-        if (!hosts) {
-            return std::nullopt;
-        }
-        for (size_t i = 0; i < topology.domain_hosts[d].size(); ++i) {
-            plan.host_increments[topology.domain_hosts[d][i]] = (*hosts)[i];
-        }
-    }
-    return plan;
-}
-
-std::optional<SlotPlan> RoundSlots(const ClassTopology& topology,
-                                   const IncrementPlan& increments,
-                                   const PtBuildConfig& config) {
-    const size_t host_count = topology.host_segments.size();
+    const size_t segment_count = topology.segments.size();
     const uint64_t total_slots =
         static_cast<uint64_t>(config.pt_count) * config.replica_num;
+
     const uint64_t host_slot_cap = std::min<uint64_t>(
         config.pt_count,
         static_cast<uint64_t>(std::ceil(
             static_cast<double>(total_slots) *
             config.host_increment_skew_k /
-            static_cast<double>(topology.host_segments.size()))));
+            static_cast<double>(host_count))));
 
     SlotPlan plan;
-    std::vector<uint64_t> domain_caps(topology.domain_hosts.size(),
-                                      config.pt_count);
+    plan.segment_slots.assign(segment_count, 0);
+    plan.host_slots.assign(host_count, 0);
+    plan.domain_slots.assign(domain_count, 0);
+
+    // Free-byte weights, aggregated bottom-up.
+    std::vector<double> segment_weights(segment_count, 0.0);
+    std::vector<double> host_weights(host_count, 0.0);
+    std::vector<double> domain_weights(domain_count, 0.0);
+    for (size_t i = 0; i < segment_count; ++i) {
+        segment_weights[i] =
+            static_cast<double>(FreeBytes(*topology.segments[i]));
+        host_weights[topology.segment_host[i]] += segment_weights[i];
+    }
+    for (size_t d = 0; d < domain_count; ++d) {
+        for (const size_t h : topology.domain_hosts[d]) {
+            domain_weights[d] += host_weights[h];
+        }
+    }
+
+    // Level 1: domain quotas with aggregated Host-cap headroom.
+    std::vector<uint64_t> domain_caps(domain_count, 0);
+    for (size_t d = 0; d < domain_count; ++d) {
+        uint64_t headroom = 0;
+        for (const size_t h : topology.domain_hosts[d]) {
+            if (host_weights[h] > 0.0) {
+                headroom += host_slot_cap;
+            }
+        }
+        domain_caps[d] = std::min<uint64_t>(config.pt_count, headroom);
+    }
     auto domain_slots =
-        RoundQuotas(increments.domain_increments, total_slots, domain_caps);
+        Apportion(domain_weights, domain_caps, total_slots);
     if (!domain_slots) {
         return std::nullopt;
     }
     plan.domain_slots = std::move(*domain_slots);
 
-    plan.host_slots.assign(host_count, 0);
-    for (size_t d = 0; d < topology.domain_hosts.size(); ++d) {
+    // Level 2: Host quotas within each domain.
+    for (size_t d = 0; d < domain_count; ++d) {
+        if (plan.domain_slots[d] == 0) {
+            continue;
+        }
         std::vector<double> weights;
         std::vector<uint64_t> caps;
         weights.reserve(topology.domain_hosts[d].size());
         caps.reserve(topology.domain_hosts[d].size());
         for (const size_t h : topology.domain_hosts[d]) {
-            weights.push_back(increments.host_increments[h]);
-            caps.push_back(host_slot_cap);
+            weights.push_back(host_weights[h]);
+            caps.push_back(host_weights[h] > 0.0 ? host_slot_cap
+                                                 : uint64_t{0});
         }
-        auto slots = RoundQuotas(weights, plan.domain_slots[d], caps);
+        auto slots = Apportion(weights, caps, plan.domain_slots[d]);
         if (!slots) {
             return std::nullopt;
         }
@@ -394,37 +403,26 @@ std::optional<SlotPlan> RoundSlots(const ClassTopology& topology,
         }
     }
 
-    // Split each integer Host quota among its Segments independently.
-    plan.segment_slots.resize(topology.segments.size(), 0);
+    // Level 3: Segment quotas within each Host.
     for (size_t h = 0; h < host_count; ++h) {
-        double host_segment_total = 0.0;
-        for (const size_t i : topology.host_segments[h]) {
-            host_segment_total += increments.segment_increments[i];
+        if (plan.host_slots[h] == 0) {
+            continue;
         }
-        if (host_segment_total <= 1e-12) {
+        const std::vector<size_t>& members = topology.host_segments[h];
+        std::vector<double> weights;
+        std::vector<uint64_t> caps;
+        weights.reserve(members.size());
+        caps.reserve(members.size());
+        for (const size_t i : members) {
+            weights.push_back(segment_weights[i]);
+            caps.push_back(config.pt_count);  // Per-row exclusivity bound.
+        }
+        auto slots = Apportion(weights, caps, plan.host_slots[h]);
+        if (!slots) {
             return std::nullopt;
         }
-        uint64_t assigned_segment_slots = 0;
-        std::vector<std::pair<double, size_t>> segment_remainders;
-        segment_remainders.reserve(topology.host_segments[h].size());
-        for (const size_t i : topology.host_segments[h]) {
-            const double raw = static_cast<double>(plan.host_slots[h]) *
-                               increments.segment_increments[i] /
-                               host_segment_total;
-            plan.segment_slots[i] =
-                static_cast<uint64_t>(std::floor(raw));
-            assigned_segment_slots += plan.segment_slots[i];
-            segment_remainders.emplace_back(
-                raw - static_cast<double>(plan.segment_slots[i]), i);
-        }
-        std::stable_sort(segment_remainders.begin(), segment_remainders.end(),
-                         [](const auto& a, const auto& b) {
-                             return a.first > b.first;
-                         });
-        for (size_t r = 0;
-             assigned_segment_slots < plan.host_slots[h]; ++r) {
-            ++plan.segment_slots[segment_remainders[r].second];
-            ++assigned_segment_slots;
+        for (size_t i = 0; i < members.size(); ++i) {
+            plan.segment_slots[members[i]] = (*slots)[i];
         }
     }
     return plan;
@@ -491,8 +489,7 @@ std::optional<std::vector<size_t>> PickRowGroups(
         std::vector<std::pair<double, size_t>> scored;
         scored.reserve(deferrable.size());
         for (size_t group : deferrable) {
-            const uint64_t key =
-                deterministicRandomHashString(0, stable_keys[group]);
+            const uint64_t key = StableKey(stable_keys[group]);
             const double score = deterministicWeightedScore(
                 row_seed, kDomainLevel, key,
                 static_cast<double>(remaining_slots[group]));
@@ -565,8 +562,7 @@ std::optional<std::vector<PtEntry>> BuildRows(
                 if (host_remaining[h] == 0) {
                     continue;
                 }
-                const uint64_t key =
-                    deterministicRandomHashString(0, host_keys[h]);
+                const uint64_t key = StableKey(host_keys[h]);
                 const double score = deterministicWeightedScore(
                     row_seed, kHostLevel, key,
                     static_cast<double>(host_remaining[h]));
@@ -735,12 +731,7 @@ bool PtViewBuilder::BuildPolicy(
     if (!topology) {
         return false;
     }
-    auto increments = PlanIncrements(*topology, config);
-    if (!increments) {
-        return false;
-    }
-
-    auto slots = RoundSlots(*topology, *increments, config);
+    auto slots = ComputeSlotPlan(*topology, config);
     if (!slots) {
         return false;
     }
