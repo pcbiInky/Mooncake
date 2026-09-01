@@ -1,14 +1,15 @@
 #include "placement/pt_view_builder.h"
 
-#include <cstdint>
-#include <string_view>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
+
+#include "random.h"
 
 namespace mooncake {
 
@@ -50,20 +51,6 @@ struct SlotPlan {
 // draw (see PickRowGroups for the one place that still does).
 // ---------------------------------------------------------------------
 
-// Deterministic pseudo-random helpers for stable placement decisions. Unlike
-// threadLocalRandomEngine(), these functions are pure: identical seed/key
-// inputs always produce identical results across rebuilds.
-inline uint64_t deterministicRandomMix(uint64_t value) {
-    value += 0x9E3779B97F4A7C15ULL;
-    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
-    return value ^ (value >> 31);
-}
-
-inline uint64_t deterministicRandomHash(uint64_t seed, uint64_t key) {
-    return deterministicRandomMix(seed ^ deterministicRandomMix(key));
-}
-
 // Salt for pre-hashing string keys (domain IDs, host IDs) into stable
 // uint64 keys. Fixed (not seed-derived) so the key identity is stable
 // across rebuilds; the per-row randomness comes from row_seed inside
@@ -71,32 +58,8 @@ inline uint64_t deterministicRandomHash(uint64_t seed, uint64_t key) {
 // the same one-pass pattern via deterministicRandomHash.
 constexpr uint64_t kStableKeySalt = 0;
 
-inline uint64_t deterministicRandomHashString(uint64_t seed,
-                                              std::string_view key) {
-    uint64_t hash = deterministicRandomMix(seed);
-    for (const unsigned char byte : key) {
-        hash = deterministicRandomMix(hash ^ byte);
-    }
-    return hash;
-}
-
 inline uint64_t StableKey(const std::string& value) {
     return deterministicRandomHashString(kStableKeySalt, value);
-}
-
-// Efraimidis-Spirakis / straw2-style score. Pick the candidate with the
-// greatest score. A non-positive weight is never selected.
-inline double deterministicWeightedScore(uint64_t seed, uint64_t stream,
-                                         uint64_t key, double weight) {
-    if (!(weight > 0.0) || !std::isfinite(weight)) {
-        return -std::numeric_limits<double>::infinity();
-    }
-    const uint64_t hash = deterministicRandomHash(
-        deterministicRandomHash(seed, stream), key);
-    constexpr double kTwoTo53 = 9007199254740992.0;
-    const double uniform =
-        static_cast<double>((hash >> 11) + 1) / kTwoTo53;
-    return std::log(uniform) / weight;
 }
 
 // ---------------------------------------------------------------------
@@ -162,13 +125,41 @@ std::optional<std::vector<uint64_t>> Apportion(
         return quotas;
     }
 
+    // Water Filling depends only on weight ratios. Normalize allocatable
+    // positive weights in two steps so physical byte units (MiB, GiB, TiB)
+    // cannot change lambda's numeric scale, while avoiding overflow when
+    // summing heterogeneous raw capacities.
+    double max_positive_weight = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        if (effective_caps[i] > 0) {
+            max_positive_weight =
+                std::max(max_positive_weight, positive_weights[i]);
+        }
+    }
+    if (!(max_positive_weight > 0.0) ||
+        !std::isfinite(max_positive_weight)) {
+        return std::nullopt;
+    }
+    double normalized_sum = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        if (effective_caps[i] > 0) {
+            positive_weights[i] /= max_positive_weight;
+            normalized_sum += positive_weights[i];
+        } else {
+            positive_weights[i] = 0.0;
+        }
+    }
+    if (!(normalized_sum > 0.0) || !std::isfinite(normalized_sum)) {
+        return std::nullopt;
+    }
+    for (double& weight : positive_weights) {
+        weight /= normalized_sum;
+    }
+
     // Lambda water-filling: find the smallest lambda with Sum(min(cap',
-    // lambda*w)) == total. The bracket starts wide enough for any
-    // positive weight scale (exponential growth bounds lambda_high in
-    // O(log(total / (w_min * eps))) steps): fixing lambda_high = total
-    // alone would under-bracket when weights are much smaller than
-    // total (e.g. normalized weights), silently degrading the
-    // distribution to index-order splitting.
+    // lambda*w)) == total. Weights sum to one, so lambda is independent of
+    // the physical capacity unit. Exponential growth still handles capped
+    // heavy candidates that require redistributing slots to tiny weights.
     auto capped_sum = [&](double lambda) {
         double sum = 0.0;
         for (size_t i = 0; i < count; ++i) {
@@ -215,6 +206,9 @@ std::optional<std::vector<uint64_t>> Apportion(
             remainders.emplace_back(raw - floored, i);
         }
     }
+    if (assigned > total) {
+        return std::nullopt;
+    }
     std::stable_sort(remainders.begin(), remainders.end(),
                      [](const auto& lhs, const auto& rhs) {
                          return lhs.first > rhs.first;
@@ -236,6 +230,9 @@ std::optional<std::vector<uint64_t>> Apportion(
         if (!made_progress) {
             return std::nullopt;  // Unreachable with valid inputs.
         }
+    }
+    if (assigned != total) {
+        return std::nullopt;
     }
     return quotas;
 }

@@ -12,8 +12,11 @@
 //  6. Invalid direct builder configuration is rejected.
 //  7. Rack-aware placement, missing-Rack Host fallback, and multi-NIC Hosts.
 //  8. Rack topology and size-class combinations with no feasible PT view.
-//  9. Fixed-seed reproducibility and input-order independence.
-// 10. Straw2 row-pair diversity and bounded scale-out remapping.
+//  9. Multi-NIC Segments on one Host never occupy two replica positions.
+// 10. Infeasible Rack and Host-cap combinations are rejected.
+// 11. Fixed-seed reproducibility and input-order independence.
+// 12. Straw2 row-pair diversity and bounded scale-out remapping.
+// 13. Production-scale TiB capacity remains numerically stable.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -33,6 +36,7 @@ using namespace mooncake;
 namespace {
 
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+constexpr uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
 
 PtSegmentSnapshot MakeSegment(const std::string& name,
                                const std::string& host, uint64_t capacity_gib,
@@ -44,8 +48,8 @@ PtSegmentSnapshot MakeSegment(const std::string& name,
     snapshot.name = name;
     snapshot.host_id = host;
     snapshot.rack_id = rack;
-    snapshot.capacity = capacity_gib * kMiB;
-    snapshot.used = used_gib * kMiB;
+    snapshot.capacity = capacity_gib * kGiB;
+    snapshot.used = used_gib * kGiB;
     snapshot.largest_free =
         snapshot.capacity > snapshot.used ? snapshot.capacity - snapshot.used
                                           : 0;
@@ -525,7 +529,7 @@ int main() {
         // formed, so the builder must keep the old view.
         std::vector<PtSegmentSnapshot> rack_without_contiguous_space = {
             MakeSegment("a", "hostA", 16, 0, "rackA"),
-            MakeSegment("b", "hostB", 16, 15, "rackB"),
+            MakeSegment("b", "hostB", 16, 16, "rackB"),
         };
         Check(!PtViewBuilder::Build(rack_without_contiguous_space, config)
                    .has_value(),
@@ -622,6 +626,49 @@ int main() {
                           "scenario12: new Rack receives its exact share");
                     Check(changed_rows <= new_rack_rows + 16,
                           "scenario12: scale-out avoids broad old-Rack churn");
+                }
+            }
+        }
+    }
+
+    // ---- Scenario 13: physical free-byte scale must not affect normalized
+    // Water Filling. Scaling the same topology from 16 GiB to 1 TiB per
+    // Segment must preserve both exact quotas and the fixed-seed PT layout.
+    {
+        std::vector<PtSegmentSnapshot> baseline_segments;
+        for (size_t i = 0; i < 4; ++i) {
+            const std::string suffix(1, static_cast<char>('A' + i));
+            baseline_segments.push_back(MakeSegment(
+                "scaled" + suffix, "host" + suffix, 16, 0,
+                "rack" + suffix));
+        }
+        std::vector<PtSegmentSnapshot> large_segments = baseline_segments;
+        for (auto& segment : large_segments) {
+            segment.capacity = 1024 * kGiB;
+            segment.used = 0;
+            segment.largest_free = segment.capacity;
+        }
+
+        auto baseline_view =
+            PtViewBuilder::Build(baseline_segments, config);
+        auto large_view = PtViewBuilder::Build(large_segments, config);
+        Check(baseline_view.has_value() && large_view.has_value(),
+              "scenario13: 16 GiB and 1 TiB views build");
+        if (baseline_view && large_view) {
+            const PtPolicyView* baseline_policy =
+                baseline_view->FindPolicy(8 * kGiB);
+            const PtPolicyView* large_policy =
+                large_view->FindPolicy(8 * kGiB);
+            Check(baseline_policy != nullptr && large_policy != nullptr,
+                  "scenario13: largest size-class policies exist");
+            if (baseline_policy && large_policy) {
+                Check(SamePolicyLayout(*baseline_policy, *large_policy),
+                      "scenario13: capacity scaling preserves PT layout");
+                const auto tally =
+                    TallyPolicy(*large_policy, config.seed, 0);
+                for (const auto& segment : large_segments) {
+                    Check(tally.slots.at(segment.name) == 64,
+                          "scenario13: each 1 TiB Segment gets 64 slots");
                 }
             }
         }

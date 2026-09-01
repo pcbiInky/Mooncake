@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <future>
 #include <gtest/gtest.h>
+#include <limits>
 #include <netinet/in.h>
 #include <random>
 #include <vector>
@@ -78,6 +79,27 @@ TEST(RandomTest, RejectsInvalidBounds) {
     std::mt19937_64 engine(42);
     EXPECT_THROW(randomIndex(0, engine), std::invalid_argument);
     EXPECT_THROW(randomUniform(2, 1, engine), std::invalid_argument);
+}
+
+TEST(RandomTest, DeterministicHelpersAreStable) {
+    EXPECT_EQ(deterministicRandomHash(42, 7),
+              deterministicRandomHash(42, 7));
+    EXPECT_NE(deterministicRandomHash(42, 7),
+              deterministicRandomHash(43, 7));
+    EXPECT_EQ(deterministicRandomHashString(42, "rack-a"),
+              deterministicRandomHashString(42, "rack-a"));
+    EXPECT_NE(deterministicRandomHashString(42, "rack-a"),
+              deterministicRandomHashString(42, "rack-b"));
+}
+
+TEST(RandomTest, DeterministicWeightedScoreHonorsWeight) {
+    const double low_weight = deterministicWeightedScore(42, 0, 7, 1.0);
+    const double high_weight = deterministicWeightedScore(42, 0, 7, 2.0);
+    EXPECT_GT(high_weight, low_weight);
+    EXPECT_TRUE(std::isinf(deterministicWeightedScore(42, 0, 7, 0.0)));
+    EXPECT_LT(deterministicWeightedScore(42, 0, 7, 0.0), 0.0);
+    EXPECT_TRUE(std::isinf(deterministicWeightedScore(
+        42, 0, 7, std::numeric_limits<double>::quiet_NaN())));
 }
 
 TEST(UtilsTest, ByteSizeToString) {
