@@ -17,6 +17,7 @@
 // 11. Fixed-seed reproducibility and input-order independence.
 // 12. Straw2 row-pair diversity and bounded scale-out remapping.
 // 13. Production-scale TiB capacity remains numerically stable.
+// 14. Heavily skewed free-space ratios at byte scale conserve slots.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -669,6 +670,55 @@ int main() {
                 for (const auto& segment : large_segments) {
                     Check(tally.slots.at(segment.name) == 64,
                           "scenario13: each 1 TiB Segment gets 64 slots");
+                }
+            }
+        }
+    }
+
+    // ---- Scenario 14: heavily skewed free-space ratios at byte scale.
+    // One TiB-dominant Rack and GiB/MiB-scale Racks must conserve the slot
+    // budget exactly and respect the Host k/N cap, distinguishing the
+    // suffix-sum breakpoint scan from any residual-based Water Filling.
+    {
+        std::vector<PtSegmentSnapshot> skewed_segments = {
+            MakeSegment("skewA", "hostA", 1024, 0, "rackA"),
+            MakeSegment("skewB", "hostB", 1, 0, "rackB"),
+            MakeSegment("skewC", "hostC", 1, 0, "rackC"),
+            MakeSegment("skewD", "hostD", 1, 0, "rackD"),
+        };
+        // Byte-precise 100 MiB free on the two smallest Racks.
+        for (size_t i = 2; i < skewed_segments.size(); ++i) {
+            skewed_segments[i].used = kGiB - 100 * kMiB;
+            skewed_segments[i].largest_free = 100 * kMiB;
+        }
+
+        auto view = PtViewBuilder::Build(skewed_segments, config);
+        Check(view.has_value(), "scenario14: skewed topology builds");
+        if (view) {
+            // All four Racks are eligible for the 32 MiB class.
+            const PtPolicyView* policy = view->FindPolicy(32 * kMiB);
+            Check(policy != nullptr, "scenario14: 32 MiB policy exists");
+            if (policy) {
+                const auto tally = TallyPolicy(*policy, config.seed, 0);
+                size_t total_slots = 0;
+                for (const auto& [name, slots] : tally.slots) {
+                    total_slots += slots;
+                }
+                Check(total_slots ==
+                          static_cast<size_t>(config.pt_count) *
+                              config.replica_num,
+                      "scenario14: slots conserve the PT budget");
+                Check(tally.slots.at("skewA") == 96,
+                      "scenario14: dominant Rack saturates the Host cap");
+                Check(tally.slots.at("skewB") == 96,
+                      "scenario14: GiB Rack saturates the Host cap");
+                Check(tally.slots.at("skewC") == 32,
+                      "scenario14: MiB Rack gets its exact share");
+                Check(tally.slots.at("skewD") == 32,
+                      "scenario14: MiB Rack gets its exact share");
+                for (const auto& [name, slots] : tally.slots) {
+                    Check(slots <= 96,
+                          "scenario14: no Host exceeds the k/N cap");
                 }
             }
         }

@@ -81,8 +81,10 @@ inline uint64_t StableKey(const std::string& value) {
 //      terminates with exact quota conservation (sum(quotas) == total
 //      and quota_i <= cap'_i for every i).
 //
-// Construction: lambda water-filling (x_i = min(cap'_i, lambda * w_i),
-// binary-searched until Sum(x) == total), then floor + a single
+// Construction: a one-pass breakpoint scan (candidates sorted by
+// cap_i / w_i, remaining budget walked once against suffix-summed
+// weights) yields x_i = min(cap'_i, lambda* * w_i) exactly, with no
+// iteration count or convergence tolerance to tune. Then floor + a single
 // largest-remainder pass over positive-weight candidates, skipping
 // candidates already at their effective cap. The remainder pass keeps
 // at least one unit of slack per candidate by construction, so it can
@@ -156,35 +158,76 @@ std::optional<std::vector<uint64_t>> Apportion(
         weight /= normalized_sum;
     }
 
-    // Lambda water-filling: find the smallest lambda with Sum(min(cap',
-    // lambda*w)) == total. Weights sum to one, so lambda is independent of
-    // the physical capacity unit. Exponential growth still handles capped
-    // heavy candidates that require redistributing slots to tiny weights.
-    auto capped_sum = [&](double lambda) {
-        double sum = 0.0;
-        for (size_t i = 0; i < count; ++i) {
-            if (effective_caps[i] > 0) {
-                sum += std::min(static_cast<double>(effective_caps[i]),
-                                lambda * positive_weights[i]);
-            }
-        }
-        return sum;
-    };
-    double lambda_low = 0.0;
-    double lambda_high = 1.0;
-    while (capped_sum(lambda_high) < static_cast<double>(total)) {
-        lambda_low = lambda_high;
-        lambda_high *= 2.0;
-    }
-    while (lambda_high > lambda_low * (1.0 + 1e-9) + 1e-9) {
-        const double lambda_mid = 0.5 * (lambda_low + lambda_high);
-        if (capped_sum(lambda_mid) < static_cast<double>(total)) {
-            lambda_low = lambda_mid;
-        } else {
-            lambda_high = lambda_mid;
+    // One-pass breakpoint scan, replacing the previous lambda bisection.
+    // Candidates are sorted by cap_i / w_i (tightest first). Walking them in
+    // that order, every prefix satisfies the water-filling breakpoint
+    // condition: while remaining_budget / (weight of the uncapped tail)
+    // exceeds the next candidate's cap/w ratio, that candidate saturates.
+    // The scan is exact: there is no iteration count or convergence
+    // tolerance to tune, and no large-minus-large subtraction anywhere.
+    // `remaining_budget` walks by integer subtraction of saturated caps
+    // (exact under double); the uncapped tail weight is precomputed as a
+    // suffix sum so it is always the direct accumulation of the members
+    // still in play, never a residual of two large sums.
+    // Candidates ordered by tightness: cap_i / w_i ascending, so the most
+    // constrained candidates are considered first.
+    std::vector<size_t> order;
+    order.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (effective_caps[i] > 0) {
+            order.push_back(i);
         }
     }
-    const double lambda = lambda_high;
+    std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        return static_cast<double>(effective_caps[lhs]) /
+                   positive_weights[lhs] <
+               static_cast<double>(effective_caps[rhs]) /
+                   positive_weights[rhs];
+    });
+
+    std::vector<double> suffix_weight(order.size() + 1, 0.0);
+    for (size_t rank = order.size(); rank > 0; --rank) {
+        suffix_weight[rank - 1] =
+            suffix_weight[rank] + positive_weights[order[rank - 1]];
+    }
+
+    double remaining_budget = static_cast<double>(total);
+    double lambda_star = 0.0;
+    size_t rank = 0;
+    const size_t eligible_count = order.size();
+    for (; rank < eligible_count; ++rank) {
+        const double tail_weight = suffix_weight[rank];
+        if (!(tail_weight > 0.0)) {
+            return std::nullopt;
+        }
+        const size_t candidate = order[rank];
+        if (remaining_budget / tail_weight >
+            static_cast<double>(effective_caps[candidate]) /
+                positive_weights[candidate]) {
+            remaining_budget -= static_cast<double>(effective_caps[candidate]);
+            continue;
+        }
+        lambda_star = remaining_budget / tail_weight;
+        break;
+    }
+
+    std::vector<double> raw_slots(count, 0.0);
+    if (rank == eligible_count) {
+        // All candidates saturating would allocate Sum(effective caps) >
+        // total (the equality case already returned early), which violates
+        // conservation. The breakpoint comparison cannot flip for valid
+        // integer budgets, so this is unreachable; reject hostile floats.
+        return std::nullopt;
+    }
+    for (size_t r = 0; r < rank; ++r) {
+        raw_slots[order[r]] = static_cast<double>(effective_caps[order[r]]);
+    }
+    for (size_t r = rank; r < eligible_count; ++r) {
+        const size_t candidate = order[r];
+        raw_slots[candidate] = std::min(
+            lambda_star * positive_weights[candidate],
+            static_cast<double>(effective_caps[candidate]));
+    }
 
     // Floor + largest remainder. `assigned` tracks the committed sum; the
     // invariant Sum(floor(x_i)) <= total <= Sum(effective_caps) leaves
@@ -195,9 +238,7 @@ std::optional<std::vector<uint64_t>> Apportion(
     remainders.reserve(count);
     uint64_t assigned = 0;
     for (size_t i = 0; i < count; ++i) {
-        const double raw =
-            std::min(static_cast<double>(effective_caps[i]),
-                     lambda * positive_weights[i]);
+        const double raw = raw_slots[i];
         const double floored = std::floor(std::max(0.0, raw));
         quotas[i] = std::min<uint64_t>(
             static_cast<uint64_t>(floored), effective_caps[i]);
