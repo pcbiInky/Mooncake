@@ -632,7 +632,7 @@ int main() {
         }
     }
 
-    // ---- Scenario 13: physical free-byte scale must not affect normalized
+    // ---- Scenario 13: physical free-byte scale must not affect breakpoint
     // Water Filling. Scaling the same topology from 16 GiB to 1 TiB per
     // Segment must preserve both exact quotas and the fixed-seed PT layout.
     {

@@ -127,37 +127,6 @@ std::optional<std::vector<uint64_t>> Apportion(
         return quotas;
     }
 
-    // Water Filling depends only on weight ratios. Normalize allocatable
-    // positive weights in two steps so physical byte units (MiB, GiB, TiB)
-    // cannot change lambda's numeric scale, while avoiding overflow when
-    // summing heterogeneous raw capacities.
-    double max_positive_weight = 0.0;
-    for (size_t i = 0; i < count; ++i) {
-        if (effective_caps[i] > 0) {
-            max_positive_weight =
-                std::max(max_positive_weight, positive_weights[i]);
-        }
-    }
-    if (!(max_positive_weight > 0.0) ||
-        !std::isfinite(max_positive_weight)) {
-        return std::nullopt;
-    }
-    double normalized_sum = 0.0;
-    for (size_t i = 0; i < count; ++i) {
-        if (effective_caps[i] > 0) {
-            positive_weights[i] /= max_positive_weight;
-            normalized_sum += positive_weights[i];
-        } else {
-            positive_weights[i] = 0.0;
-        }
-    }
-    if (!(normalized_sum > 0.0) || !std::isfinite(normalized_sum)) {
-        return std::nullopt;
-    }
-    for (double& weight : positive_weights) {
-        weight /= normalized_sum;
-    }
-
     // One-pass breakpoint scan, replacing the previous lambda bisection.
     // Candidates are sorted by cap_i / w_i (tightest first). Walking them in
     // that order, every prefix satisfies the water-filling breakpoint
