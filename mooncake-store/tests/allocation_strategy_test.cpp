@@ -1064,4 +1064,106 @@ TEST(NofPtReplicaAllocatorTest, RollsBackPartialMultiReplicaRow) {
     EXPECT_EQ(first->size(), 0U);
 }
 
+TEST(NofPtReplicaAllocatorTest,
+     OversizeTriesEveryRowUsingExistingRandomSelection) {
+    PtAllocatorMap allocators;
+    auto small1 = std::make_shared<OffsetBufferAllocator>(
+        "small1", 0x125000000ULL, 8 * 1024, "small1",
+        ReplicaType::NOF_SSD);
+    auto small2 = std::make_shared<OffsetBufferAllocator>(
+        "small2", 0x126000000ULL, 8 * 1024, "small2",
+        ReplicaType::NOF_SSD);
+    allocators.emplace(PtRegionId(1), small1);
+    allocators.emplace(PtRegionId(2), small2);
+    allocators.emplace(
+        PtRegionId(9),
+        std::make_shared<OffsetBufferAllocator>(
+            "large1", 0x130000000ULL, 32 * MiB, "large1",
+            ReplicaType::NOF_SSD));
+    allocators.emplace(
+        PtRegionId(10),
+        std::make_shared<OffsetBufferAllocator>(
+            "large2", 0x140000000ULL, 32 * MiB, "large2",
+            ReplicaType::NOF_SSD));
+
+    constexpr size_t kRowCount = 5;
+    constexpr uint64_t kSeed = 73;
+    RandomEngine probe(kSeed);
+    std::vector<size_t> row_indices(kRowCount);
+    std::iota(row_indices.begin(), row_indices.end(), 0);
+    for (size_t attempt = 0; attempt + 1 < kRowCount; ++attempt) {
+        const size_t selected =
+            randomUniform(attempt, row_indices.size() - 1, probe);
+        std::swap(row_indices[attempt], row_indices[selected]);
+    }
+    const size_t good_row = row_indices.back();
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    PtPolicyView policy;
+    policy.min_aligned_request_size_exclusive = 0;
+    policy.max_aligned_request_size_inclusive = 8 * 1024;
+    policy.entries.resize(kRowCount);
+    for (size_t i = 0; i < kRowCount; ++i) {
+        policy.entries[i].pt_id = static_cast<uint32_t>(i);
+        policy.entries[i].replicas = {
+            PtTarget{PtRegionId(1), "small1", "host-a", "",
+                     "host:host-a"},
+            PtTarget{PtRegionId(2), "small2", "host-b", "",
+                     "host:host-b"},
+        };
+    }
+    policy.entries[good_row].replicas = {
+        PtTarget{PtRegionId(9), "large1", "host-c", "", "host:host-c"},
+        PtTarget{PtRegionId(10), "large2", "host-d", "", "host:host-d"},
+    };
+    view->policies.push_back(std::move(policy));
+    view_manager.Publish(std::move(view));
+
+    threadLocalRandomEngine().seed(kSeed);
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(12 * 1024, 2,
+                                     MakePtResolver(allocators));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->size(), 2U);
+    EXPECT_EQ(small1->size(), 0U);
+    EXPECT_EQ(small2->size(), 0U);
+}
+
+TEST(NofPtReplicaAllocatorTest,
+     MissingInteriorClassDoesNotUseLargestPolicyAsOversizeFallback) {
+    PtAllocatorMap allocators;
+    allocators.emplace(
+        PtRegionId(1),
+        std::make_shared<OffsetBufferAllocator>(
+            "candidate", 0x150000000ULL, 32 * MiB, "candidate",
+            ReplicaType::NOF_SSD));
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 1;
+    PtPolicyView small;
+    small.min_aligned_request_size_exclusive = 0;
+    small.max_aligned_request_size_inclusive = 8 * 1024;
+    small.entries.push_back(PtEntry{
+        0,
+        {PtTarget{PtRegionId(1), "candidate", "host-a", "",
+                  "host:host-a"}},
+    });
+    PtPolicyView large = small;
+    large.min_aligned_request_size_exclusive = 16 * 1024;
+    large.max_aligned_request_size_inclusive = 32 * 1024;
+    view->policies.push_back(std::move(small));
+    view->policies.push_back(std::move(large));
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(12 * 1024, 1,
+                                     MakePtResolver(allocators));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(allocators.at(PtRegionId(1))->size(), 0U);
+}
+
 }  // namespace mooncake

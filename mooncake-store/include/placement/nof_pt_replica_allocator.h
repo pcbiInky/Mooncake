@@ -28,7 +28,9 @@ class NofPtReplicaAllocator final {
     // target within the row) or exactly view->configured_replica_num
     // (multi-replica mode: the whole row). Any other value is
     // INVALID_PARAMS. Returns NO_AVAILABLE_HANDLE when no usable view or
-    // target exists; allocation failures roll back cleanly.
+    // target exists; allocation failures roll back cleanly. Requests beyond
+    // the largest size class use that class as an oversize candidate table
+    // and try all rows in randomized order using the actual request size.
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         size_t size, size_t replica_count,
         const AllocateTargetFn& allocate_target);

@@ -29,24 +29,41 @@ tl::expected<std::vector<Replica>, ErrorCode> NofPtReplicaAllocator::Allocate(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Size-class policy lookup. Requests beyond the largest class are
-    // rejected rather than silently placed in the wrong class.
+    // Normal requests use their exact size-class policy. A request beyond the
+    // largest class reuses that policy only as a candidate table and attempts
+    // allocation using the actual request size.
     const PtPolicyView* policy = view->FindPolicy(size);
-    if (!policy || policy->entries.empty()) {
+    bool oversize = false;
+    if (!policy) {
+        const auto largest_policy = std::max_element(
+            view->policies.begin(), view->policies.end(),
+            [](const PtPolicyView& lhs, const PtPolicyView& rhs) {
+                return lhs.max_aligned_request_size_inclusive <
+                       rhs.max_aligned_request_size_inclusive;
+            });
+        if (largest_policy == view->policies.end() ||
+            size <= largest_policy->max_aligned_request_size_inclusive) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        policy = &*largest_policy;
+        oversize = true;
+    }
+    if (policy->entries.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    // Row retry (RFC 0005 §8.2): try up to 3 distinct PT rows. A failed
-    // row rolls back cleanly and a different row is drawn without
-    // replacement.
+    // Normal requests try up to three random rows without replacement.
+    // Oversize requests are expected to be rare, so they try every row without
+    // changing the common-path bound.
     constexpr size_t kMaxRowAttempts = 3;
-    const size_t max_attempts =
-        std::min<size_t>(kMaxRowAttempts, policy->entries.size());
+    const size_t max_attempts = oversize ? policy->entries.size()
+                                    : std::min<size_t>(kMaxRowAttempts,
+                                                       policy->entries.size());
     std::vector<size_t> row_indices(policy->entries.size());
     std::iota(row_indices.begin(), row_indices.end(), 0);
     for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
         // Draw without replacement by lazily shuffling the untried suffix.
-        // This gives bounded work even when most rows have already failed.
+        // This gives bounded work even when most rows fail.
         const size_t selected =
             randomUniform(attempt, row_indices.size() - 1);
         std::swap(row_indices[attempt], row_indices[selected]);
