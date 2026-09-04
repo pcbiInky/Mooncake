@@ -807,15 +807,14 @@ struct HttpPtViewResponse {
     bool success{true};
     bool has_active_view{false};
     uint64_t epoch{0};
-    uint64_t resource_epoch{0};
     uint64_t created_at_ns{0};
     uint32_t pt_count{0};
     uint32_t configured_replica_num{0};
     uint64_t seed{0};
     std::vector<HttpPtPolicy> policies;
 };
-YLT_REFL(HttpPtViewResponse, success, has_active_view, epoch, resource_epoch,
-         created_at_ns, pt_count, configured_replica_num, seed, policies);
+YLT_REFL(HttpPtViewResponse, success, has_active_view, epoch, created_at_ns,
+         pt_count, configured_replica_num, seed, policies);
 
 void MasterAdminServer::HandleGetPtView(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -833,7 +832,6 @@ void MasterAdminServer::HandleGetPtView(
         if (view) {
             payload.has_active_view = true;
             payload.epoch = view->epoch;
-            payload.resource_epoch = view->resource_epoch;
             payload.created_at_ns = view->created_at_ns;
             payload.pt_count = view->pt_count;
             payload.configured_replica_num = view->configured_replica_num;

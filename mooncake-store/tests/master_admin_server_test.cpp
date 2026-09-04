@@ -1318,7 +1318,6 @@ struct HttpPtViewTestResponse {
     bool success{false};
     bool has_active_view{false};
     uint64_t epoch{0};
-    uint64_t resource_epoch{0};
     uint64_t created_at_ns{0};
     uint32_t pt_count{0};
     uint32_t configured_replica_num{0};
@@ -1326,8 +1325,7 @@ struct HttpPtViewTestResponse {
     std::vector<HttpPtViewTestPolicy> policies;
 };
 YLT_REFL(HttpPtViewTestResponse, success, has_active_view, epoch,
-         resource_epoch, created_at_ns, pt_count, configured_replica_num, seed,
-         policies);
+         created_at_ns, pt_count, configured_replica_num, seed, policies);
 
 #ifdef USE_NOF
 NoFSegment MakePtViewTestSegment(std::string name, std::string host_id,

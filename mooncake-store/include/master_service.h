@@ -380,7 +380,6 @@ class MasterService {
 
     struct PtViewDetail {
         uint64_t epoch{0};
-        uint64_t resource_epoch{0};
         uint64_t created_at_ns{0};
         uint32_t pt_count{0};
         uint32_t configured_replica_num{0};

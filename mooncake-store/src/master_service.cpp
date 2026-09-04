@@ -3029,7 +3029,6 @@ auto MasterService::GetPtViewDetail()
 
     PtViewDetail detail;
     detail.epoch = view->epoch;
-    detail.resource_epoch = view->resource_epoch;
     detail.created_at_ns = view->created_at_ns;
     detail.pt_count = view->pt_count;
     detail.configured_replica_num = view->configured_replica_num;
