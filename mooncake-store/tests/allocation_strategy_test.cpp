@@ -1,4 +1,5 @@
 #include "allocation_strategy.h"
+#include "placement/nof_pt_replica_allocator.h"
 
 #include <gtest/gtest.h>
 
@@ -1020,6 +1021,279 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         << "Overhead ratio:      " << std::setprecision(2) << overhead_ratio
         << "x  (" << std::setprecision(1) << (overhead_ratio - 1.0) * 100.0
         << "% slower)\n\n";
+}
+
+namespace {
+
+UUID PtRegionId(uint64_t value) { return UUID{value, 1}; }
+
+using PtAllocatorMap =
+    std::unordered_map<UUID, std::shared_ptr<BufferAllocatorBase>,
+                       boost::hash<UUID>>;
+
+NofPtReplicaAllocator::AllocateTargetFn MakePtResolver(
+    const PtAllocatorMap& allocators) {
+    return [&allocators](const PtTarget& target, size_t size) {
+        const auto it = allocators.find(target.region_id);
+        if (it == allocators.end() ||
+            it->second->getSegmentName() != target.name) {
+            return std::unique_ptr<AllocatedBuffer>{};
+        }
+        return it->second->allocate(size);
+    };
+}
+
+}  // namespace
+
+TEST(NofPtReplicaAllocatorTest, RetriesADistinctRowAfterAllocationFailure) {
+    PtAllocatorMap allocators;
+    allocators.emplace(PtRegionId(3), std::make_shared<OffsetBufferAllocator>(
+                                          "good1", 0x100000000ULL, 16 * MiB,
+                                          "good1", ReplicaType::NOF_SSD));
+    allocators.emplace(PtRegionId(4), std::make_shared<OffsetBufferAllocator>(
+                                          "good2", 0x110000000ULL, 16 * MiB,
+                                          "good2", ReplicaType::NOF_SSD));
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    view->entries.resize(2);
+
+    RandomEngine probe(42);
+    const size_t first_row =
+        randomUniform<size_t>(0, view->entries.size() - 1, probe);
+    const size_t good_row = 1 - first_row;
+    view->entries[first_row].replicas = {
+        PtTarget{PtRegionId(1), "bad1", "host-a", "", "host:host-a"},
+        PtTarget{PtRegionId(2), "bad2", "host-b", "", "host:host-b"},
+    };
+    view->entries[good_row].replicas = {
+        PtTarget{PtRegionId(3), "good1", "host-c", "", "host:host-c"},
+        PtTarget{PtRegionId(4), "good2", "host-d", "", "host:host-d"},
+    };
+    view_manager.Publish(std::move(view));
+
+    threadLocalRandomEngine().seed(42);
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(4096, 1, MakePtResolver(allocators));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+    const auto& descriptor =
+        result->front().get_descriptor().get_nof_descriptor();
+    EXPECT_TRUE(descriptor.buffer_descriptor.transport_endpoint_ == "good1" ||
+                descriptor.buffer_descriptor.transport_endpoint_ == "good2");
+}
+
+TEST(NofPtReplicaAllocatorTest, RollsBackPartialMultiReplicaRow) {
+    PtAllocatorMap allocators;
+    auto first = std::make_shared<OffsetBufferAllocator>(
+        "first", 0x120000000ULL, 16 * MiB, "first", ReplicaType::NOF_SSD);
+    allocators.emplace(PtRegionId(1), first);
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    view->entries.push_back(PtEntry{
+        0,
+        {
+            PtTarget{PtRegionId(1), "first", "host-a", "", "host:host-a"},
+            PtTarget{PtRegionId(2), "failed", "host-b", "", "host:host-b"},
+        },
+    });
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(4096, 2, MakePtResolver(allocators));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(first->size(), 0U);
+}
+
+TEST(NofPtReplicaAllocatorTest,
+     SizeAgnosticViewRetriesWithinBoundUsingRandomSelection) {
+    PtAllocatorMap allocators;
+    auto small1 = std::make_shared<OffsetBufferAllocator>(
+        "small1", 0x125000000ULL, 8 * 1024, "small1", ReplicaType::NOF_SSD);
+    auto small2 = std::make_shared<OffsetBufferAllocator>(
+        "small2", 0x126000000ULL, 8 * 1024, "small2", ReplicaType::NOF_SSD);
+    allocators.emplace(PtRegionId(1), small1);
+    allocators.emplace(PtRegionId(2), small2);
+    allocators.emplace(PtRegionId(9), std::make_shared<OffsetBufferAllocator>(
+                                          "large1", 0x130000000ULL, 32 * MiB,
+                                          "large1", ReplicaType::NOF_SSD));
+    allocators.emplace(PtRegionId(10), std::make_shared<OffsetBufferAllocator>(
+                                           "large2", 0x140000000ULL, 32 * MiB,
+                                           "large2", ReplicaType::NOF_SSD));
+
+    constexpr size_t kRowCount = 5;
+    constexpr uint64_t kSeed = 73;
+    RandomEngine probe(kSeed);
+    const size_t start_row = randomIndex(kRowCount, probe);
+    size_t row_stride = 1;
+    do {
+        row_stride = randomUniform<size_t>(1, kRowCount - 1, probe);
+    } while (std::gcd(row_stride, kRowCount) != 1);
+    size_t good_row = start_row;
+    constexpr size_t kMaxRowAttempts = 3;
+    for (size_t i = 1; i < kMaxRowAttempts; ++i) {
+        good_row = good_row >= kRowCount - row_stride
+                       ? good_row - (kRowCount - row_stride)
+                       : good_row + row_stride;
+    }
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    view->entries.resize(kRowCount);
+    for (size_t i = 0; i < kRowCount; ++i) {
+        view->entries[i].pt_id = static_cast<uint32_t>(i);
+        view->entries[i].replicas = {
+            PtTarget{PtRegionId(1), "small1", "host-a", "", "host:host-a"},
+            PtTarget{PtRegionId(2), "small2", "host-b", "", "host:host-b"},
+        };
+    }
+    view->entries[good_row].replicas = {
+        PtTarget{PtRegionId(9), "large1", "host-c", "", "host:host-c"},
+        PtTarget{PtRegionId(10), "large2", "host-d", "", "host:host-d"},
+    };
+    view_manager.Publish(std::move(view));
+
+    threadLocalRandomEngine().seed(kSeed);
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(12 * 1024, 2, MakePtResolver(allocators));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->size(), 2U);
+    EXPECT_EQ(small1->size(), 0U);
+    EXPECT_EQ(small2->size(), 0U);
+}
+
+TEST(NofPtReplicaAllocatorTest, StopsAfterThreeRowAttempts) {
+    constexpr size_t kRowCount = 5;
+    constexpr uint64_t kSeed = 91;
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 1;
+    view->entries.resize(kRowCount);
+    for (size_t i = 0; i < kRowCount; ++i) {
+        view->entries[i].pt_id = static_cast<uint32_t>(i);
+        view->entries[i].replicas = {
+            PtTarget{PtRegionId(i + 1), "candidate" + std::to_string(i),
+                     "host-" + std::to_string(i), "",
+                     "host:host-" + std::to_string(i)},
+        };
+    }
+    view_manager.Publish(std::move(view));
+
+    size_t attempts = 0;
+    threadLocalRandomEngine().seed(kSeed);
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result =
+        allocator.Allocate(4096, 1, [&attempts](const PtTarget&, size_t) {
+            ++attempts;
+            return std::unique_ptr<AllocatedBuffer>{};
+        });
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(attempts, 3U);
+}
+
+TEST(NofPtReplicaAllocatorTest, AnyRequestSizeUsesTheSingleView) {
+    PtAllocatorMap allocators;
+    allocators.emplace(PtRegionId(1), std::make_shared<OffsetBufferAllocator>(
+                                          "candidate", 0x150000000ULL, 32 * MiB,
+                                          "candidate", ReplicaType::NOF_SSD));
+
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 1;
+    view->entries.push_back(PtEntry{
+        0,
+        {PtTarget{PtRegionId(1), "candidate", "host-a", "", "host:host-a"}},
+    });
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    auto result = allocator.Allocate(12 * 1024, 1, MakePtResolver(allocators));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+}
+
+TEST(NofPtReplicaAllocatorTest, RejectsWidthOutsideSingleOrConfigured) {
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 2;
+    view->entries.push_back(PtEntry{
+        0,
+        {
+            PtTarget{PtRegionId(1), "a", "host-a", "", "host:host-a"},
+            PtTarget{PtRegionId(2), "b", "host-b", "", "host:host-b"},
+        },
+    });
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    // 1 (single-replica) and R_config (2) are the only accepted widths.
+    for (const size_t requested : {0U, 3U, 4U}) {
+        auto result =
+            allocator.Allocate(4096, requested, [](const PtTarget&, size_t) {
+                return std::unique_ptr<AllocatedBuffer>{};
+            });
+        ASSERT_FALSE(result.has_value()) << "width " << requested;
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST(NofPtReplicaAllocatorTest, RejectsZeroSizeAndMissingResolver) {
+    PtViewManager view_manager;
+    auto view = std::make_shared<PtView>();
+    view->configured_replica_num = 1;
+    view->entries.push_back(PtEntry{
+        0, {PtTarget{PtRegionId(1), "candidate", "host-a", "", "host:host-a"}}});
+    view_manager.Publish(std::move(view));
+
+    NofPtReplicaAllocator allocator(view_manager);
+    const NofPtReplicaAllocator::AllocateTargetFn noop =
+        [](const PtTarget&, size_t) {
+            return std::unique_ptr<AllocatedBuffer>{};
+        };
+    EXPECT_EQ(allocator.Allocate(0, 1, noop).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(allocator.Allocate(4096, 1, nullptr).error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST(NofPtReplicaAllocatorTest, MissingOrEmptyViewReturnsNoHandle) {
+    NofPtReplicaAllocator::AllocateTargetFn noop =
+        [](const PtTarget&, size_t) {
+            return std::unique_ptr<AllocatedBuffer>{};
+        };
+
+    // No view was ever published.
+    PtViewManager empty_manager;
+    NofPtReplicaAllocator empty_allocator(empty_manager);
+    EXPECT_EQ(empty_allocator.Allocate(4096, 1, noop).error(),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // A published view with zero rows is unusable.
+    PtViewManager rowless_manager;
+    auto rowless = std::make_shared<PtView>();
+    rowless->configured_replica_num = 1;
+    rowless_manager.Publish(std::move(rowless));
+    NofPtReplicaAllocator rowless_allocator(rowless_manager);
+    EXPECT_EQ(rowless_allocator.Allocate(4096, 1, noop).error(),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // A published view whose configured width is unknown is unusable.
+    PtViewManager widthless_manager;
+    auto widthless = std::make_shared<PtView>();
+    widthless->entries.push_back(PtEntry{
+        0, {PtTarget{PtRegionId(1), "candidate", "host-a", "", "host:host-a"}}});
+    widthless_manager.Publish(std::move(widthless));
+    NofPtReplicaAllocator widthless_allocator(widthless_manager);
+    EXPECT_EQ(widthless_allocator.Allocate(4096, 1, noop).error(),
+              ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 }  // namespace mooncake

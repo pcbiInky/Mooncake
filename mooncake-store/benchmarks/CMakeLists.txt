@@ -65,3 +65,8 @@ endif()
 
 add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
 target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+# NoF PT view build benchmark
+add_executable(pt_view_build_bench pt_view_build_bench.cpp)
+target_link_libraries(pt_view_build_bench PRIVATE mooncake_store
+                                                     gflags::gflags glog::glog)

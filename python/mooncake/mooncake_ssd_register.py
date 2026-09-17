@@ -145,6 +145,8 @@ class MooncakeNoFRegister:
             target = self._parse_spdk_target_info(target_info)
             ip = target.get("ip")
             path = target.get("path")
+            host_id = target.get("host_id", "")
+            rack_id = target.get("rack_id", "")
 
             if not ip or not path:
                 logging.error(f"Invalid target info: {target_info}")
@@ -208,6 +210,8 @@ class MooncakeNoFRegister:
                             "size": size,
                             "master_server_address": master_server_address,
                             "metadata_server": "",
+                            "host_id": host_id,
+                            "rack_id": rack_id,
                         }
 
                         ssd_configs.append(ssd_config)
@@ -256,6 +260,8 @@ class MooncakeNoFRegister:
                     cfg["base"],
                     cfg["size"],
                     cfg["master_server_address"],
+                    cfg.get("host_id", ""),
+                    cfg.get("rack_id", ""),
                 )
 
                 if ret != 0:

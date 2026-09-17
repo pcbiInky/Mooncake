@@ -339,7 +339,7 @@ int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
                       std::string(info->trid.subnqn) + "|" +
                       std::to_string(static_cast<int>(info->trid.trtype));
 
-    LOG(INFO) << "traddr:" << info->trid.traddr
+    VLOG(1) << "traddr:" << info->trid.traddr
               << "trsvcid:" << info->trid.trsvcid << "ns:" << info->ns
               << "subnqn:" << info->trid.subnqn
               << "trtype:" << info->trid.trtype;

@@ -38,6 +38,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
+    placement/pt_view_builder.cpp
+    placement/nof_pt_replica_allocator.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
