@@ -229,6 +229,14 @@ struct MasterConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+
+    // NoF PT placement; disabled by default.
+    bool enable_nof_pt_allocation = false;
+    uint32_t nof_pt_count = 128;
+    uint32_t nof_pt_replica_num = 2;
+    double nof_pt_host_increment_skew_k = 1.5;
+    uint64_t nof_pt_normal_rebuild_interval_ms = 60000;
+    uint64_t nof_pt_fast_rebuild_interval_ms = 5000;
 };
 
 class MasterServiceSupervisorConfig {
@@ -339,6 +347,14 @@ class MasterServiceSupervisorConfig {
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
 
+    // NoF PT placement; disabled by default.
+    bool enable_nof_pt_allocation = false;
+    uint32_t nof_pt_count = 128;
+    uint32_t nof_pt_replica_num = 2;
+    double nof_pt_host_increment_skew_k = 1.5;
+    uint64_t nof_pt_normal_rebuild_interval_ms = 60000;
+    uint64_t nof_pt_fast_rebuild_interval_ms = 5000;
+
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
@@ -404,6 +420,14 @@ class MasterServiceSupervisorConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        enable_nof_pt_allocation = config.enable_nof_pt_allocation;
+        nof_pt_count = config.nof_pt_count;
+        nof_pt_replica_num = config.nof_pt_replica_num;
+        nof_pt_host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+        nof_pt_normal_rebuild_interval_ms =
+            config.nof_pt_normal_rebuild_interval_ms;
+        nof_pt_fast_rebuild_interval_ms =
+            config.nof_pt_fast_rebuild_interval_ms;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -605,6 +629,14 @@ class WrappedMasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+
+    // NoF PT placement; disabled by default.
+    bool enable_nof_pt_allocation = false;
+    uint32_t nof_pt_count = 128;
+    uint32_t nof_pt_replica_num = 2;
+    double nof_pt_host_increment_skew_k = 1.5;
+    uint64_t nof_pt_normal_rebuild_interval_ms = 60000;
+    uint64_t nof_pt_fast_rebuild_interval_ms = 5000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -707,6 +739,14 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        enable_nof_pt_allocation = config.enable_nof_pt_allocation;
+        nof_pt_count = config.nof_pt_count;
+        nof_pt_replica_num = config.nof_pt_replica_num;
+        nof_pt_host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+        nof_pt_normal_rebuild_interval_ms =
+            config.nof_pt_normal_rebuild_interval_ms;
+        nof_pt_fast_rebuild_interval_ms =
+            config.nof_pt_fast_rebuild_interval_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -836,6 +876,14 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        enable_nof_pt_allocation = config.enable_nof_pt_allocation;
+        nof_pt_count = config.nof_pt_count;
+        nof_pt_replica_num = config.nof_pt_replica_num;
+        nof_pt_host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+        nof_pt_normal_rebuild_interval_ms =
+            config.nof_pt_normal_rebuild_interval_ms;
+        nof_pt_fast_rebuild_interval_ms =
+            config.nof_pt_fast_rebuild_interval_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -1334,6 +1382,14 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
+
+    // NoF PT placement; disabled by default.
+    bool enable_nof_pt_allocation = false;
+    uint32_t nof_pt_count = 128;
+    uint32_t nof_pt_replica_num = 2;
+    double nof_pt_host_increment_skew_k = 1.5;
+    uint64_t nof_pt_normal_rebuild_interval_ms = 60000;
+    uint64_t nof_pt_fast_rebuild_interval_ms = 5000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -1432,6 +1488,14 @@ class MasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
+        enable_nof_pt_allocation = config.enable_nof_pt_allocation;
+        nof_pt_count = config.nof_pt_count;
+        nof_pt_replica_num = config.nof_pt_replica_num;
+        nof_pt_host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+        nof_pt_normal_rebuild_interval_ms =
+            config.nof_pt_normal_rebuild_interval_ms;
+        nof_pt_fast_rebuild_interval_ms =
+            config.nof_pt_fast_rebuild_interval_ms;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;

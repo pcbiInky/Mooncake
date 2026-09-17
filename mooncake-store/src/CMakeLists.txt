@@ -38,6 +38,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
+    placement/pt_view_builder.cpp
+    placement/nof_pt_replica_allocator.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
@@ -306,7 +308,7 @@ endif()
 
 if(USE_NOF)
   add_subdirectory(spdk)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES ${SPDK_WRAPPER_SOURCES})
 
   # The master's NoF heartbeat probe also goes through SpdkWrapper.
   list(APPEND MOONCAKE_STORE_MASTER_SOURCES ${SPDK_WRAPPER_SOURCES}
@@ -431,7 +433,8 @@ add_library(mooncake_store_shared_objects OBJECT
 set_target_properties(mooncake_store_shared_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mooncake_store_shared_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                   ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
@@ -442,6 +445,12 @@ target_link_libraries(
           numa
           asio_shared
           yalantinglibs::yalantinglibs)
+if(USE_NOF)
+  # The NoF SPDK wrapper moved into the shared object set, so it now needs the
+  # SPDK headers and the Store source root (for "config/..." includes) here.
+  target_include_directories(mooncake_store_shared_objects
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_shared_objects build_etcd_wrapper)
 endif()
@@ -585,6 +594,9 @@ if(STORE_USE_REDIS)
 endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
+endif()
+if(USE_NOF)
+  target_link_libraries(mooncake_store_master PRIVATE ${SPDK_STATIC_LIBS})
 endif()
 
 # Complete public Store library.

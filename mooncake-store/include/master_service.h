@@ -35,6 +35,7 @@
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "placement/pt_rebuild_scheduler.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
@@ -302,6 +303,34 @@ class MasterService {
      */
     auto GetSegmentsDetail()
         -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>;
+
+    /** Active NoF placement-table snapshot for admin queries. */
+    struct PtTargetDetail {
+        std::string segment_id;
+        std::string name;
+        std::string host_id;
+        std::string rack_id;
+        std::string failure_domain_id;
+    };
+
+    struct PtEntryDetail {
+        uint32_t pt_id{0};
+        std::vector<PtTargetDetail> replicas;
+    };
+
+    struct PtViewDetail {
+        uint64_t epoch{0};
+        uint64_t created_at_ns{0};
+        uint32_t pt_count{0};
+        uint32_t configured_replica_num{0};
+        uint64_t seed{0};
+        std::vector<PtEntryDetail> entries;
+    };
+
+    // Returns no value before the first publication, or
+    // UNAVAILABLE_IN_CURRENT_MODE when PT allocation is disabled.
+    auto GetPtViewDetail()
+        -> tl::expected<std::optional<PtViewDetail>, ErrorCode>;
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
@@ -1502,6 +1531,11 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
     void NofHeartbeatThreadFunc();
+
+    static PtBuildConfig BuildPtBuildConfig(const MasterServiceConfig& config);
+    tl::expected<size_t, ErrorCode> ValidateNofReplicaCount(
+        size_t requested_nof_replica_num) const;
+
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
         const std::string& error_reason);
@@ -2184,6 +2218,9 @@ class MasterService {
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
+    const bool enable_nof_pt_allocation_;
+    const uint32_t nof_pt_replica_num_;
+    std::unique_ptr<PtRebuildScheduler> pt_rebuild_scheduler_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

@@ -82,4 +82,23 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest, PtRebuildIntervalsPropagateToServingConfigs) {
+    MasterConfig master_config{};
+    master_config.nof_pt_normal_rebuild_interval_ms = 1234;
+    master_config.nof_pt_fast_rebuild_interval_ms = 123;
+
+    WrappedMasterServiceConfig direct_wrapped_config(master_config, 1);
+    MasterServiceConfig direct_service_config(direct_wrapped_config);
+    EXPECT_EQ(1234u, direct_service_config.nof_pt_normal_rebuild_interval_ms);
+    EXPECT_EQ(123u, direct_service_config.nof_pt_fast_rebuild_interval_ms);
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig ha_wrapped_config(supervisor_config, 1);
+    MasterServiceConfig ha_service_config(ha_wrapped_config);
+    EXPECT_EQ(1234u, supervisor_config.nof_pt_normal_rebuild_interval_ms);
+    EXPECT_EQ(123u, supervisor_config.nof_pt_fast_rebuild_interval_ms);
+    EXPECT_EQ(1234u, ha_service_config.nof_pt_normal_rebuild_interval_ms);
+    EXPECT_EQ(123u, ha_service_config.nof_pt_fast_rebuild_interval_ms);
+}
+
 }  // namespace mooncake::test

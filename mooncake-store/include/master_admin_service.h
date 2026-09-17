@@ -90,6 +90,8 @@ class MasterAdminServer {
                                 coro_http::coro_http_response& resp);
     async_simple::coro::Lazy<void> HandleExpandDfsShards(
         coro_http::coro_http_request& req, coro_http::coro_http_response& resp);
+    void HandleGetPtView(coro_http::coro_http_request& req,
+                         coro_http::coro_http_response& resp);
     void HandleCreateDrainJob(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
     void HandleQueryDrainJob(coro_http::coro_http_request& req,
