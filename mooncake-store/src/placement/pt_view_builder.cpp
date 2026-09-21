@@ -22,6 +22,22 @@ uint64_t FreeBytes(const PtSegmentSnapshot& segment) {
                                            : 0;
 }
 
+double SegmentWeight(const PtSegmentSnapshot& segment, PtSegmentWeightMode mode,
+                     double target_utilization) {
+    switch (mode) {
+        case PtSegmentWeightMode::TARGET_HEADROOM: {
+            const double target_bytes =
+                static_cast<double>(segment.capacity) * target_utilization;
+            return std::max(
+                0.0, target_bytes - static_cast<double>(std::min(
+                                        segment.used, segment.capacity)));
+        }
+        case PtSegmentWeightMode::CAPACITY:
+            return static_cast<double>(segment.capacity);
+    }
+    return 0.0;
+}
+
 struct PlacementTopology {
     std::vector<const PtSegmentSnapshot*> segments;
     std::vector<size_t> segment_host;
@@ -99,8 +115,7 @@ std::optional<std::vector<uint64_t>> Apportion(
     std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
         return static_cast<double>(effective_caps[lhs]) /
                    positive_weights[lhs] <
-               static_cast<double>(effective_caps[rhs]) /
-                   positive_weights[rhs];
+               static_cast<double>(effective_caps[rhs]) / positive_weights[rhs];
     });
 
     std::vector<double> suffix_weight(order.size() + 1, 0.0);
@@ -139,9 +154,9 @@ std::optional<std::vector<uint64_t>> Apportion(
     }
     for (size_t r = rank; r < eligible_count; ++r) {
         const size_t candidate = order[r];
-        raw_slots[candidate] = std::min(
-            lambda_star * positive_weights[candidate],
-            static_cast<double>(effective_caps[candidate]));
+        raw_slots[candidate] =
+            std::min(lambda_star * positive_weights[candidate],
+                     static_cast<double>(effective_caps[candidate]));
     }
 
     // Floor then distribute the residue by largest remainder.
@@ -151,8 +166,8 @@ std::optional<std::vector<uint64_t>> Apportion(
     for (size_t i = 0; i < count; ++i) {
         const double raw = raw_slots[i];
         const double floored = std::floor(std::max(0.0, raw));
-        quotas[i] = std::min<uint64_t>(
-            static_cast<uint64_t>(floored), effective_caps[i]);
+        quotas[i] = std::min<uint64_t>(static_cast<uint64_t>(floored),
+                                       effective_caps[i]);
         assigned += quotas[i];
         if (effective_caps[i] > quotas[i]) {
             remainders.emplace_back(raw - floored, i);
@@ -161,10 +176,9 @@ std::optional<std::vector<uint64_t>> Apportion(
     if (assigned > total) {
         return std::nullopt;
     }
-    std::stable_sort(remainders.begin(), remainders.end(),
-                     [](const auto& lhs, const auto& rhs) {
-                         return lhs.first > rhs.first;
-                     });
+    std::stable_sort(
+        remainders.begin(), remainders.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
     while (assigned < total) {
         bool made_progress = false;
         for (const auto& [remainder, i] : remainders) {
@@ -234,9 +248,9 @@ std::optional<PlacementTopology> BuildTopology(
         if (inserted) {
             topology.host_segments.emplace_back();
             const std::string& rack_id = rack_by_host.at(segment->host_id);
-            const std::string domain_id =
-                rack_id.empty() ? "host:" + segment->host_id
-                                : "rack:" + rack_id;
+            const std::string domain_id = rack_id.empty()
+                                              ? "host:" + segment->host_id
+                                              : "rack:" + rack_id;
             auto [domain_it, domain_inserted] =
                 domain_index.emplace(domain_id, domain_index.size());
             if (domain_inserted) {
@@ -258,11 +272,13 @@ std::optional<PlacementTopology> BuildTopology(
     return topology;
 }
 
-// Allocate slots from domain to host to segment, weighted by free bytes.
-// Host cap: min(P, ceil(P*R*k/N)); domain cap: min(P, positive host caps).
+// Allocate slots from domain to host to segment using the selected
+// segment weight. Host cap: min(P, ceil(P*R*k/N)); domain cap: min(P,
+// positive host caps).
 
-std::optional<SlotPlan> ComputeSlotPlan(const PlacementTopology& topology,
-                                        const PtBuildConfig& config) {
+std::optional<SlotPlan> ComputeSlotPlanWithMode(
+    const PlacementTopology& topology, const PtBuildConfig& config,
+    PtSegmentWeightMode weight_mode, double target_utilization) {
     const size_t host_count = topology.host_segments.size();
     const size_t domain_count = topology.domain_hosts.size();
     const size_t segment_count = topology.segments.size();
@@ -271,23 +287,24 @@ std::optional<SlotPlan> ComputeSlotPlan(const PlacementTopology& topology,
 
     const uint64_t host_slot_cap = std::min<uint64_t>(
         config.pt_count,
-        static_cast<uint64_t>(std::ceil(
-            static_cast<double>(total_slots) *
-            config.host_increment_skew_k /
-            static_cast<double>(host_count))));
+        static_cast<uint64_t>(std::ceil(static_cast<double>(total_slots) *
+                                        config.host_increment_skew_k /
+                                        static_cast<double>(host_count))));
 
     SlotPlan plan;
     plan.segment_slots.assign(segment_count, 0);
     plan.host_slots.assign(host_count, 0);
     plan.domain_slots.assign(domain_count, 0);
 
-    // Free-byte weights, aggregated bottom-up.
+    // Segment weights are aggregated bottom-up so steady-state capacity
+    // weighting also makes each Host receive traffic proportional to its
+    // provisioned capacity.
     std::vector<double> segment_weights(segment_count, 0.0);
     std::vector<double> host_weights(host_count, 0.0);
     std::vector<double> domain_weights(domain_count, 0.0);
     for (size_t i = 0; i < segment_count; ++i) {
-        segment_weights[i] =
-            static_cast<double>(FreeBytes(*topology.segments[i]));
+        segment_weights[i] = SegmentWeight(
+            *topology.segments[i], weight_mode, target_utilization);
         host_weights[topology.segment_host[i]] += segment_weights[i];
     }
     for (size_t d = 0; d < domain_count; ++d) {
@@ -307,8 +324,7 @@ std::optional<SlotPlan> ComputeSlotPlan(const PlacementTopology& topology,
         }
         domain_caps[d] = std::min<uint64_t>(config.pt_count, headroom);
     }
-    auto domain_slots =
-        Apportion(domain_weights, domain_caps, total_slots);
+    auto domain_slots = Apportion(domain_weights, domain_caps, total_slots);
     if (!domain_slots) {
         return std::nullopt;
     }
@@ -325,8 +341,7 @@ std::optional<SlotPlan> ComputeSlotPlan(const PlacementTopology& topology,
         caps.reserve(topology.domain_hosts[d].size());
         for (const size_t h : topology.domain_hosts[d]) {
             weights.push_back(host_weights[h]);
-            caps.push_back(host_weights[h] > 0.0 ? host_slot_cap
-                                                 : uint64_t{0});
+            caps.push_back(host_weights[h] > 0.0 ? host_slot_cap : uint64_t{0});
         }
         auto slots = Apportion(weights, caps, plan.domain_slots[d]);
         if (!slots) {
@@ -360,6 +375,30 @@ std::optional<SlotPlan> ComputeSlotPlan(const PlacementTopology& topology,
         }
     }
     return plan;
+}
+
+std::optional<SlotPlan> ComputeSlotPlan(
+    const PlacementTopology& topology, const PtBuildConfig& config,
+    bool* used_full_target_fallback) {
+    if (used_full_target_fallback) {
+        *used_full_target_fallback = false;
+    }
+    auto plan = ComputeSlotPlanWithMode(
+        topology, config, config.segment_weight_mode,
+        config.target_utilization);
+    if (plan ||
+        config.segment_weight_mode != PtSegmentWeightMode::TARGET_HEADROOM) {
+        return plan;
+    }
+
+    // Strict target-headroom weights may leave fewer positive Hosts or failure
+    // domains than replica_num. target=1.0 is the same formula with all actual
+    // free bytes as headroom, preserving availability without a second mode.
+    if (used_full_target_fallback) {
+        *used_full_target_fallback = true;
+    }
+    return ComputeSlotPlanWithMode(
+        topology, config, PtSegmentWeightMode::TARGET_HEADROOM, 1.0);
 }
 
 // Build rows while draining exact quotas. Domains with quota equal to the
@@ -557,8 +596,7 @@ std::optional<std::vector<PtEntry>> BuildRows(const PlacementTopology& topology,
                 topology.segments[selected_segment];
             entry.replicas.push_back(PtTarget{
                 segment->segment_id, segment->name, segment->host_id,
-                topology.host_rack_ids[selected_host],
-                topology.domain_ids[d]});
+                topology.host_rack_ids[selected_host], topology.domain_ids[d]});
         }
         entries.push_back(std::move(entry));
     }
@@ -566,11 +604,11 @@ std::optional<std::vector<PtEntry>> BuildRows(const PlacementTopology& topology,
     // Every planned quota must be drained exactly.
     const bool fully_drained =
         std::all_of(domain_remaining.begin(), domain_remaining.end(),
-                   [](uint64_t r) { return r == 0; }) &&
+                    [](uint64_t r) { return r == 0; }) &&
         std::all_of(host_remaining.begin(), host_remaining.end(),
-                   [](uint64_t r) { return r == 0; }) &&
+                    [](uint64_t r) { return r == 0; }) &&
         std::all_of(segment_remaining.begin(), segment_remaining.end(),
-                   [](uint64_t r) { return r == 0; });
+                    [](uint64_t r) { return r == 0; });
     if (!fully_drained) {
         return std::nullopt;
     }
@@ -588,12 +626,15 @@ std::optional<PtView> PtViewBuilder::Build(
         stats->total_segments = segments.size();
         stats->topology_incomplete = 0;
         stats->eligible_segments = 0;
+        stats->used_full_target_fallback = false;
         stats->build_duration_ns = 0;
     }
 
     if (config.pt_count == 0 || config.replica_num == 0 ||
         !std::isfinite(config.host_increment_skew_k) ||
-        config.host_increment_skew_k < 1.0) {
+        config.host_increment_skew_k < 1.0 ||
+        !std::isfinite(config.target_utilization) ||
+        config.target_utilization <= 0.0 || config.target_utilization > 1.0) {
         return std::nullopt;
     }
 
@@ -622,7 +663,11 @@ std::optional<PtView> PtViewBuilder::Build(
     if (!topology) {
         return std::nullopt;
     }
-    auto slots = ComputeSlotPlan(*topology, config);
+    bool used_full_target_fallback = false;
+    auto slots = ComputeSlotPlan(*topology, config, &used_full_target_fallback);
+    if (stats) {
+        stats->used_full_target_fallback = used_full_target_fallback;
+    }
     if (!slots) {
         return std::nullopt;
     }

@@ -23,6 +23,7 @@ class PtRebuildScheduler final {
                        std::chrono::milliseconds fast_interval)
         : manager_(manager),
           build_config_(build_config),
+          placement_policy_(build_config.target_utilization),
           cadence_(normal_interval, fast_interval),
           worker_([this] { RebuildOnce(); }, normal_interval) {}
     ~PtRebuildScheduler() { Stop(); }
@@ -66,30 +67,37 @@ class PtRebuildScheduler final {
     void RebuildOnce() {
         std::vector<PtSegmentSnapshot> segments = CollectSegments();
         const PtBalanceSummary balance = ComputePtBalanceSummary(segments);
+        const auto placement = placement_policy_.Observe(balance);
         const auto cadence = cadence_.Observe(balance);
         worker_.SetPeriodicInterval(cadence.next_interval);
 
         auto& view_manager = manager_.GetPtViewManager();
-        if (view_manager.GetActiveView() && !cadence.materially_changed) {
+        if (view_manager.GetActiveView() && !cadence.materially_changed &&
+            !placement.mode_changed) {
             VLOG(1) << "PtViewBuilder: skip unchanged physical state, mode="
                     << PtRebuildModeName(cadence.mode)
-                    << ", utilization_spread="
-                    << balance.utilization_spread
-                    << ", eligible=" << balance.eligible_segments;
+                    << ", utilization_spread=" << balance.utilization_spread
+                    << ", eligible=" << balance.eligible_segments
+                    << ", weight_mode="
+                    << PtSegmentWeightModeName(placement.weight_mode);
             return;
         }
 
+        PtBuildConfig effective_config = build_config_;
+        effective_config.segment_weight_mode = placement.weight_mode;
         PtBuildStats stats;
-        auto view = PtViewBuilder::Build(segments, build_config_, &stats);
+        auto view = PtViewBuilder::Build(segments, effective_config, &stats);
         if (!view) {
             LOG(WARNING) << "PtViewBuilder: no feasible view, total="
-                         << stats.total_segments
-                         << ", topology_incomplete="
+                         << stats.total_segments << ", topology_incomplete="
                          << stats.topology_incomplete
                          << ", eligible=" << stats.eligible_segments
                          << ", mode=" << PtRebuildModeName(cadence.mode)
                          << ", utilization_spread="
-                         << balance.utilization_spread;
+                         << balance.utilization_spread << ", weight_mode="
+                         << PtSegmentWeightModeName(placement.weight_mode)
+                         << ", full_target_fallback="
+                         << stats.used_full_target_fallback;
             return;
         }
         view_manager.Publish(std::make_shared<const PtView>(std::move(*view)));
@@ -101,11 +109,16 @@ class PtRebuildScheduler final {
                   << ", duration_ns=" << stats.build_duration_ns
                   << ", mode=" << PtRebuildModeName(cadence.mode)
                   << ", next_interval_ms=" << cadence.next_interval.count()
-                  << ", utilization_spread=" << balance.utilization_spread;
+                  << ", utilization_spread=" << balance.utilization_spread
+                  << ", min_utilization=" << balance.min_utilization
+                  << ", weight_mode="
+                  << PtSegmentWeightModeName(placement.weight_mode)
+                  << ", full_target_fallback=" << stats.used_full_target_fallback;
     }
 
     NoFSegmentManager& manager_;
     const PtBuildConfig build_config_;
+    PtPlacementWeightPolicy placement_policy_;
     PtRebuildCadence cadence_;
     BackgroundWorker worker_;
 };

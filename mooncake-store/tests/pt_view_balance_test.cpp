@@ -340,8 +340,7 @@ int main() {
               "scenario6: NaN skew rejected");
 
         invalid = config;
-        invalid.host_increment_skew_k =
-            std::numeric_limits<double>::infinity();
+        invalid.host_increment_skew_k = std::numeric_limits<double>::infinity();
         Check(!PtViewBuilder::Build(segments, invalid).has_value(),
               "scenario6: infinite skew rejected");
     }
@@ -634,6 +633,89 @@ int main() {
                   "scenario15: 4 GiB free receives 1/4 of Host slots");
             Check(tally.slots.at("peer") == 128,
                   "scenario15: peer Host fills one replica per row");
+        }
+    }
+
+    // Scenario 16: steady-state capacity weights ignore utilization skew.
+    {
+        PtBuildConfig capacity_config = config;
+        capacity_config.segment_weight_mode = PtSegmentWeightMode::CAPACITY;
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("capA", "hostA", 16, 15, "rackA"),
+            MakeSegment("capB", "hostB", 24, 23, "rackB"),
+            MakeSegment("capC", "hostC", 16, 8, "rackC"),
+            MakeSegment("capD", "hostD", 16, 0, "rackD"),
+        };
+
+        auto view = PtViewBuilder::Build(segments, capacity_config);
+        Check(view.has_value(), "scenario16: capacity-weighted view builds");
+        if (view) {
+            const auto tally = TallyView(*view, config.seed, 0);
+            Check(tally.slots.at("capA") == 57,
+                  "scenario16: 16 GiB segment A gets 57 slots");
+            Check(tally.slots.at("capB") == 85,
+                  "scenario16: 24 GiB segment gets 85 slots");
+            Check(tally.slots.at("capC") == 57,
+                  "scenario16: 16 GiB segment C gets 57 slots");
+            Check(tally.slots.at("capD") == 57,
+                  "scenario16: 16 GiB segment D gets 57 slots");
+        }
+    }
+
+    // Scenario 17: catch-up weights use bytes below the 90% target.
+    {
+        PtBuildConfig catch_up_config = config;
+        catch_up_config.segment_weight_mode =
+            PtSegmentWeightMode::TARGET_HEADROOM;
+        catch_up_config.target_utilization = 0.90;
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("targetA", "hostA", 100, 90, "rackA"),
+            MakeSegment("targetB", "hostB", 100, 80, "rackB"),
+            MakeSegment("targetC", "hostC", 100, 80, "rackC"),
+            MakeSegment("targetD", "hostD", 100, 80, "rackD"),
+        };
+
+        PtBuildStats stats;
+        auto view = PtViewBuilder::Build(segments, catch_up_config, &stats);
+        Check(view.has_value(), "scenario17: target-headroom view builds");
+        Check(!stats.used_full_target_fallback,
+              "scenario17: target-headroom weights are feasible");
+        if (view) {
+            const auto tally = TallyView(*view, config.seed, 0);
+            Check(tally.slots.count("targetA") == 0,
+                  "scenario17: segment at 90% receives no catch-up slots");
+            for (const char suffix : {'B', 'C', 'D'}) {
+                const std::string name = "target" + std::string(1, suffix);
+                const size_t slots = tally.slots.at(name);
+                Check(slots >= 85 && slots <= 86,
+                      "scenario17: below-target segments split catch-up slots");
+            }
+        }
+    }
+
+    // Scenario 18: strict headroom with too few positive failure domains falls
+    // back to target=1.0 instead of failing the rebuild.
+    {
+        PtBuildConfig catch_up_config = config;
+        catch_up_config.segment_weight_mode =
+            PtSegmentWeightMode::TARGET_HEADROOM;
+        catch_up_config.target_utilization = 0.90;
+        std::vector<PtSegmentSnapshot> segments = {
+            MakeSegment("oldA", "hostA", 100, 95, "rackA"),
+            MakeSegment("oldB", "hostB", 100, 95, "rackB"),
+            MakeSegment("oldC", "hostC", 100, 95, "rackC"),
+            MakeSegment("newD", "hostD", 100, 0, "rackD"),
+        };
+
+        PtBuildStats stats;
+        auto view = PtViewBuilder::Build(segments, catch_up_config, &stats);
+        Check(view.has_value(), "scenario18: fallback view builds");
+        Check(stats.used_full_target_fallback,
+              "scenario18: infeasible headroom retries with target=1.0");
+        if (view) {
+            const auto tally = TallyView(*view, config.seed, 0);
+            Check(tally.slots.at("newD") == 96,
+                  "scenario18: empty segment saturates the Host cap");
         }
     }
 

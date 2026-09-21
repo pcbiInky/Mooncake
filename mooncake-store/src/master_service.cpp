@@ -12531,6 +12531,7 @@ PtBuildConfig MasterService::BuildPtBuildConfig(
     pt_config.pt_count = config.nof_pt_count;
     pt_config.replica_num = config.nof_pt_replica_num;
     pt_config.host_increment_skew_k = config.nof_pt_host_increment_skew_k;
+    pt_config.target_utilization = 0.90;
     return pt_config;
 }
 

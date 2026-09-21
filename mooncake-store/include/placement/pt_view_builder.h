@@ -28,13 +28,28 @@ struct PtSegmentSnapshot {
 };
 
 // Prefix IDs to keep rack and host namespaces distinct.
-inline std::string EffectiveFailureDomain(
-    const PtSegmentSnapshot& segment) {
+inline std::string EffectiveFailureDomain(const PtSegmentSnapshot& segment) {
     if (!segment.rack_id.empty()) {
         return "rack:" + segment.rack_id;
     }
-    return segment.host_id.empty() ? std::string()
-                                   : "host:" + segment.host_id;
+    return segment.host_id.empty() ? std::string() : "host:" + segment.host_id;
+}
+
+enum class PtSegmentWeightMode {
+    // Future writes follow bytes below target utilization.
+    TARGET_HEADROOM,
+    // Steady state: future writes follow provisioned segment capacity.
+    CAPACITY,
+};
+
+inline const char* PtSegmentWeightModeName(PtSegmentWeightMode mode) {
+    switch (mode) {
+        case PtSegmentWeightMode::TARGET_HEADROOM:
+            return "TARGET_HEADROOM";
+        case PtSegmentWeightMode::CAPACITY:
+            return "CAPACITY";
+    }
+    return "UNKNOWN";
 }
 
 struct PtBuildConfig {
@@ -42,12 +57,17 @@ struct PtBuildConfig {
     uint32_t replica_num{2};
     double host_increment_skew_k{1.5};
     uint64_t seed{0};
+    // target=1.0 is exactly equivalent to weighting by free bytes.
+    PtSegmentWeightMode segment_weight_mode{
+        PtSegmentWeightMode::TARGET_HEADROOM};
+    double target_utilization{1.0};
 };
 
 struct PtBuildStats {
     size_t total_segments{0};
     size_t topology_incomplete{0};
     size_t eligible_segments{0};
+    bool used_full_target_fallback{false};
     uint64_t build_duration_ns{0};
 };
 
